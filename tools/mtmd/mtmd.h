@@ -289,6 +289,15 @@ DEPRECATED(MTMD_API int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tok
 MTMD_API int32_t mtmd_encode_chunk(mtmd_context * ctx,
                                    const mtmd_input_chunk * chunk);
 
+// Experimental helper for server-side cross-slot image batching.
+// Encodes multiple image chunks into one contiguous output embedding buffer.
+// token_offsets and n_tokens_out are optional arrays of n_chunks elements.
+MTMD_API int32_t mtmd_encode_image_chunks(mtmd_context * ctx,
+                                          const mtmd_input_chunk * const * chunks,
+                                          size_t n_chunks,
+                                          size_t * token_offsets,
+                                          size_t * n_tokens_out);
+
 // get output embeddings from the last encode pass
 // the reading size (in bytes) is equal to:
 // llama_model_n_embd_inp(model) * mtmd_input_chunk_get_n_tokens(chunk) * sizeof(float)

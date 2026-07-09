@@ -4017,6 +4017,26 @@ void server_context::set_state_callback(server_state_callback_t callback) {
     });
 }
 
+static mtmd_image_token_overrides request_image_token_overrides(const json & data) {
+    mtmd_image_token_overrides result;
+    result.image_min_tokens = json_value(data, "x_llama_image_min_tokens", -1);
+    if (result.image_min_tokens <= 0) {
+        result.image_min_tokens = json_value(data, "x_llama_paddleocr_image_min_tokens", -1);
+    }
+    if (result.image_min_tokens <= 0) {
+        result.image_min_tokens = -1;
+    }
+
+    result.image_max_tokens = json_value(data, "x_llama_image_max_tokens", -1);
+    if (result.image_max_tokens <= 0) {
+        result.image_max_tokens = json_value(data, "x_llama_paddleocr_image_max_tokens", -1);
+    }
+    if (result.image_max_tokens <= 0) {
+        result.image_max_tokens = -1;
+    }
+    return result;
+}
+
 //
 // server_routes
 //
@@ -4055,10 +4075,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
         // process prompt
         std::vector<server_tokens> inputs;
+        const mtmd_image_token_overrides image_token_overrides = request_image_token_overrides(data);
 
         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
-            inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files));
+            inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, false, image_token_overrides));
         } else {
             // Everything else, including multimodal completions.
             inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true);
@@ -5311,7 +5332,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const l
         if (!prompt.is_string()) {
             throw std::runtime_error("for mtmd, input prompt must be a string.");
         }
-        n_tokens = process_mtmd_prompt(mctx, prompt.get<std::string>(), files, true).size();
+        n_tokens = process_mtmd_prompt(mctx, prompt.get<std::string>(), files, true, request_image_token_overrides(body_parsed)).size();
     } else {
         n_tokens = tokenize_mixed(vocab, prompt, true, true).size();
     }

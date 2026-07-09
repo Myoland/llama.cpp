@@ -26,6 +26,13 @@ struct mtmd_image_preproc_out {
     }
 };
 
+// Thread-local experiment hook used by the server to override dynamic image
+// tokens for a single request while mtmd tokenizes its media chunks.
+int mtmd_image_set_thread_min_tokens_override(int image_min_tokens);
+int mtmd_image_get_thread_min_tokens_override();
+int mtmd_image_set_thread_max_tokens_override(int image_max_tokens);
+int mtmd_image_get_thread_max_tokens_override();
+
 // base class, models must inherit from this class
 struct mtmd_image_preprocessor {
     const clip_hparams & hparams;

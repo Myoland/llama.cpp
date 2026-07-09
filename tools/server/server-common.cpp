@@ -14,6 +14,9 @@
 #include <fstream>
 #include <limits>
 
+int mtmd_image_set_thread_min_tokens_override(int image_min_tokens);
+int mtmd_image_set_thread_max_tokens_override(int image_max_tokens);
+
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
     int code = 500;
@@ -687,40 +690,57 @@ size_t validate_utf8(const std::string& text) {
     return len;
 }
 
-server_tokens process_mtmd_prompt(mtmd_context * mctx, const std::string & prompt, const std::vector<raw_buffer> & files, bool is_placeholder) {
+server_tokens process_mtmd_prompt(
+        mtmd_context * mctx,
+        const std::string & prompt,
+        const std::vector<raw_buffer> & files,
+        bool is_placeholder,
+        mtmd_image_token_overrides image_token_overrides) {
+    const int previous_image_min_tokens_override =
+        mtmd_image_set_thread_min_tokens_override(image_token_overrides.image_min_tokens);
+    const int previous_image_max_tokens_override =
+        mtmd_image_set_thread_max_tokens_override(image_token_overrides.image_max_tokens);
     // these will be freed upon going out of scope
-    mtmd::bitmaps bitmaps;
-    std::vector<mtmd_helper::video_ptr> videos;
-    for (auto & file : files) {
-        auto out = mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size(), is_placeholder);
-        if (!out.bitmap) {
-            throw std::runtime_error("Failed to load image or audio file");
+    try {
+        mtmd::bitmaps bitmaps;
+        std::vector<mtmd_helper::video_ptr> videos;
+        for (auto & file : files) {
+            auto out = mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size(), is_placeholder);
+            if (!out.bitmap) {
+                throw std::runtime_error("Failed to load image or audio file");
+            }
+            bitmaps.entries.emplace_back(out.bitmap);
+            if (out.video_ctx) {
+                videos.emplace_back(out.video_ctx);
+            }
         }
-        bitmaps.entries.emplace_back(out.bitmap);
-        if (out.video_ctx) {
-            videos.emplace_back(out.video_ctx);
+        // process prompt
+        std::vector<server_tokens> inputs;
+        // multimodal
+        mtmd_input_text inp_txt = {
+            prompt.c_str(),
+            /* add_special */   true,
+            /* parse_special */ true,
+        };
+        mtmd::input_chunks chunks(mtmd_input_chunks_init());
+        auto bitmaps_c_ptr = bitmaps.c_ptr();
+        int32_t tokenized = mtmd_tokenize(mctx,
+                                          chunks.ptr.get(),
+                                          &inp_txt,
+                                          bitmaps_c_ptr.data(),
+                                          bitmaps_c_ptr.size());
+        if (tokenized != 0) {
+            throw std::runtime_error("Failed to tokenize prompt");
         }
+        auto result = server_tokens(chunks, true);
+        mtmd_image_set_thread_min_tokens_override(previous_image_min_tokens_override);
+        mtmd_image_set_thread_max_tokens_override(previous_image_max_tokens_override);
+        return result;
+    } catch (...) {
+        mtmd_image_set_thread_min_tokens_override(previous_image_min_tokens_override);
+        mtmd_image_set_thread_max_tokens_override(previous_image_max_tokens_override);
+        throw;
     }
-    // process prompt
-    std::vector<server_tokens> inputs;
-    // multimodal
-    mtmd_input_text inp_txt = {
-        prompt.c_str(),
-        /* add_special */   true,
-        /* parse_special */ true,
-    };
-    mtmd::input_chunks chunks(mtmd_input_chunks_init());
-    auto bitmaps_c_ptr = bitmaps.c_ptr();
-    int32_t tokenized = mtmd_tokenize(mctx,
-                                      chunks.ptr.get(),
-                                      &inp_txt,
-                                      bitmaps_c_ptr.data(),
-                                      bitmaps_c_ptr.size());
-    if (tokenized != 0) {
-        throw std::runtime_error("Failed to tokenize prompt");
-    }
-    auto result = server_tokens(chunks, true);
-    return result;
 }
 
 /**

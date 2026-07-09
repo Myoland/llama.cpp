@@ -31,6 +31,11 @@ using json = nlohmann::ordered_json;
 
 using raw_buffer = std::vector<uint8_t>;
 
+struct mtmd_image_token_overrides {
+    int image_min_tokens = -1;
+    int image_max_tokens = -1;
+};
+
 template <typename T>
 static T json_value(const json & body, const std::string & key, const T & default_value) {
     // Fallback null to default value
@@ -257,7 +262,12 @@ size_t validate_utf8(const std::string& text);
 
 // process mtmd prompt, return the server_tokens containing both text tokens and media chunks
 // if is_placeholder is true, the media chunk will be treated as placeholder for counting tokens; the output tokens are not usable for actual inference (e.g. for submitting a task to server_queue)
-server_tokens process_mtmd_prompt(mtmd_context * mctx, const std::string & prompt, const std::vector<raw_buffer> & files, bool is_placeholder = false);
+server_tokens process_mtmd_prompt(
+        mtmd_context * mctx,
+        const std::string & prompt,
+        const std::vector<raw_buffer> & files,
+        bool is_placeholder = false,
+        mtmd_image_token_overrides image_token_overrides = {});
 
 /**
  * break the input "prompt" object into multiple prompt if needed, then tokenize them

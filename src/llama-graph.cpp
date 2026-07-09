@@ -61,6 +61,20 @@ static bool can_reuse_kq_mask(
     return res;
 }
 
+static bool use_no_cache_equal_seqs_streams(const llama_ubatch & ubatch) {
+    static const bool enabled = []() {
+        const char * env = getenv("LLAMA_EXPERIMENT_NO_CACHE_EQUAL_SEQS_STREAMS");
+        return env ? atoi(env) != 0 : false;
+    }();
+
+    return enabled
+        && ubatch.equal_seqs()
+        && ubatch.n_seqs_unq > 1
+        && ubatch.n_seqs == ubatch.n_seqs_unq
+        && ubatch.n_seq_tokens > 0
+        && ubatch.n_tokens == ubatch.n_seq_tokens*ubatch.n_seqs_unq;
+}
+
 // impl
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
@@ -404,44 +418,92 @@ static void print_mask(const T * data, int64_t n_tokens, int64_t n_kv, int64_t n
 }
 
 void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
-    const int64_t n_kv     = ubatch->n_tokens;
     const int64_t n_tokens = ubatch->n_tokens;
+    const int64_t n_stream = self_kq_mask->ne[3];
+    const int64_t n_kv     = self_kq_mask->ne[0];
+    const int64_t n_tps    = self_kq_mask->ne[1];
 
     const auto fill_mask = [&](auto * data, int64_t ne, int n_swa, llama_swa_type swa_type) {
         using T = std::remove_reference_t<decltype(*data)>;
         std::fill(data, data + ne, llama_cast<T>(-INFINITY));
 
-        for (int i1 = 0; i1 < n_tokens; ++i1) {
-            const llama_seq_id s1 = ubatch->seq_id[i1][0];
-            const llama_pos    p1 = ubatch->pos[i1];
+        if (n_stream > 1) {
+            GGML_ASSERT(n_kv == n_tps);
+            GGML_ASSERT(n_tokens == n_tps*n_stream);
 
-            const uint64_t idst = i1*n_kv;
+            for (int64_t is = 0; is < n_stream; ++is) {
+                const int64_t stream_off = is*n_tps*n_kv;
 
-            for (int i0 = 0; i0 < n_tokens; ++i0) {
-                const llama_seq_id s0 = ubatch->seq_id[i0][0];
-                const llama_pos p0    = ubatch->pos[i0];
+                for (int64_t i1 = 0; i1 < n_tps; ++i1) {
+                    const int64_t g1 = is*n_tps + i1;
+                    const llama_seq_id s1 = ubatch->seq_id[g1][0];
+                    const llama_pos    p1 = ubatch->pos[g1];
 
-                // mask different sequences
-                if (s0 != s1) {
-                    continue;
+                    const uint64_t idst = stream_off + i1*n_kv;
+
+                    for (int64_t i0 = 0; i0 < n_tps; ++i0) {
+                        const int64_t g0 = is*n_tps + i0;
+                        const llama_seq_id s0 = ubatch->seq_id[g0][0];
+                        const llama_pos p0    = ubatch->pos[g0];
+
+                        // mask different sequences
+                        if (s0 != s1) {
+                            continue;
+                        }
+
+                        // mask future tokens
+                        if (cparams.causal_attn && p0 > p1) {
+                            continue;
+                        }
+
+                        // apply SWA if any
+                        if (llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
+                            continue;
+                        }
+
+                        data[idst + i0] = llama_cast<T>(hparams.use_alibi ? -std::abs(p0 - p1) : 0.0f);
+                    }
                 }
-
-                // mask future tokens
-                if (cparams.causal_attn && p0 > p1) {
-                    continue;
-                }
-
-                // apply SWA if any
-                if (llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
-                    continue;
-                }
-
-                data[idst + i0] = llama_cast<T>(hparams.use_alibi ? -std::abs(p0 - p1) : 0.0f);
             }
-        }
 
-        if (debug) {
-            print_mask(data, n_tokens, n_kv, n_swa, swa_type);
+            if (debug) {
+                for (int64_t is = 0; is < n_stream; ++is) {
+                    print_mask(data + is*n_tps*n_kv, n_tps, n_kv, n_swa, swa_type);
+                }
+            }
+        } else {
+            for (int i1 = 0; i1 < n_tokens; ++i1) {
+                const llama_seq_id s1 = ubatch->seq_id[i1][0];
+                const llama_pos    p1 = ubatch->pos[i1];
+
+                const uint64_t idst = i1*n_kv;
+
+                for (int i0 = 0; i0 < n_tokens; ++i0) {
+                    const llama_seq_id s0 = ubatch->seq_id[i0][0];
+                    const llama_pos p0    = ubatch->pos[i0];
+
+                    // mask different sequences
+                    if (s0 != s1) {
+                        continue;
+                    }
+
+                    // mask future tokens
+                    if (cparams.causal_attn && p0 > p1) {
+                        continue;
+                    }
+
+                    // apply SWA if any
+                    if (llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
+                        continue;
+                    }
+
+                    data[idst + i0] = llama_cast<T>(hparams.use_alibi ? -std::abs(p0 - p1) : 0.0f);
+                }
+            }
+
+            if (debug) {
+                print_mask(data, n_tokens, n_kv, n_swa, swa_type);
+            }
         }
     };
 
@@ -2508,14 +2570,27 @@ llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() con
     // flash attention requires an f16 mask
     const auto type_mask = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
+    const bool no_cache_equal_seqs_streams = use_no_cache_equal_seqs_streams(ubatch);
+    const int64_t n_stream = no_cache_equal_seqs_streams ? ubatch.n_seqs_unq : 1;
+    const int64_t n_tokens_per_stream = n_tokens/n_stream;
+
+    if (no_cache_equal_seqs_streams) {
+        static bool logged = false;
+        if (!logged) {
+            LLAMA_LOG_INFO("%s: LLAMA_EXPERIMENT_NO_CACHE_EQUAL_SEQS_STREAMS enabled, n_tokens = %d, n_stream = %d, n_seq_tokens = %d\n",
+                    __func__, (int) n_tokens, (int) n_stream, (int) n_tokens_per_stream);
+            logged = true;
+        }
+    }
+
     // note: there is no KV cache, so the number of KV values is equal to the number of tokens in the batch
-    inp->self_kq_mask = ggml_new_tensor_4d(ctx0, type_mask, n_tokens, n_tokens, 1, 1);
+    inp->self_kq_mask = ggml_new_tensor_4d(ctx0, type_mask, n_tokens_per_stream, n_tokens_per_stream, 1, n_stream);
     ggml_set_input(inp->self_kq_mask);
 
     inp->self_kq_mask_cnv = inp->self_kq_mask;
 
     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-        inp->self_kq_mask_swa = ggml_new_tensor_4d(ctx0, type_mask, n_tokens, n_tokens, 1, 1);
+        inp->self_kq_mask_swa = ggml_new_tensor_4d(ctx0, type_mask, n_tokens_per_stream, n_tokens_per_stream, 1, n_stream);
         ggml_set_input(inp->self_kq_mask_swa);
 
         inp->self_kq_mask_swa_cnv = inp->self_kq_mask_swa;
@@ -2560,6 +2635,23 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = k_cur;
     ggml_tensor * v = v_cur;
+
+    const int64_t n_stream = kq_mask->ne[3];
+    if (n_stream > 1) {
+        GGML_ASSERT(ubatch.equal_seqs());
+        GGML_ASSERT(ubatch.n_tokens % n_stream == 0);
+        const int64_t n_tokens_per_stream = ubatch.n_tokens/n_stream;
+
+        k = ggml_view_4d(ctx0, k,
+                k->ne[0], k->ne[1], n_tokens_per_stream, n_stream,
+                k->nb[1], k->nb[2], k->nb[2]*n_tokens_per_stream, 0);
+        v = ggml_view_4d(ctx0, v,
+                v->ne[0], v->ne[1], n_tokens_per_stream, n_stream,
+                v->nb[1], v->nb[2], v->nb[2]*n_tokens_per_stream, 0);
+
+        cb(k, "Kcur_stream", il);
+        cb(v, "Vcur_stream", il);
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);

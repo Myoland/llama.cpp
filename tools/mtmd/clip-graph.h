@@ -39,6 +39,8 @@ struct clip_graph {
 
     // TODO [QWEN_VIDEO]: improve this in the future
     int n_batch = 1;
+    bool paddleocr_padded_batch = false;
+    std::vector<clip_image_size> batch_image_sizes;
 
     ggml_context_ptr ctx0_ptr;
     ggml_context * ctx0;
@@ -65,6 +67,7 @@ struct clip_graph {
 
     // siglip2 naflex
     ggml_tensor * resize_position_embeddings(uint32_t interpolation_mode = DEFAULT_INTERPOLATION_MODE);
+    ggml_tensor * resize_position_embeddings_to(int width, int height, uint32_t interpolation_mode = DEFAULT_INTERPOLATION_MODE);
 
     // build vision transformer (ViT) cgraph
     // this function should cover most of the models

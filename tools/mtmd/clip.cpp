@@ -283,9 +283,13 @@ void clip_graph::cb(ggml_tensor * cur, const char * name, int il) const {
 
 // siglip2 naflex
 ggml_tensor * clip_graph::resize_position_embeddings(uint32_t interpolation_mode) {
+    const int height = img.ny() / patch_size;
+    const int width  = img.nx() / patch_size;
+    return resize_position_embeddings_to(width, height, interpolation_mode);
+}
+
+ggml_tensor * clip_graph::resize_position_embeddings_to(int width, int height, uint32_t interpolation_mode) {
     ggml_tensor * pos_embd = model.position_embeddings;
-    const int height       = img.ny() / patch_size;
-    const int width        = img.nx() / patch_size;
     const uint32_t mode    = interpolation_mode;
     const int n_per_side   = (int)std::sqrt(pos_embd->ne[1]);
 
@@ -534,8 +538,13 @@ ggml_tensor * clip_graph::build_vit(
 ggml_tensor * clip_graph::build_inp() {
     ggml_tensor * inp_raw = build_inp_raw();
     ggml_tensor * inp = ggml_conv_2d(ctx0, model.patch_embeddings_0, inp_raw, patch_size, patch_size, 0, 0, 1, 1);
-    inp = ggml_reshape_3d(ctx0, inp, n_patches, n_embd, n_batch);
-    inp = ggml_cont(ctx0, ggml_transpose(ctx0, inp));
+    if (n_batch == 1) {
+        inp = ggml_reshape_2d(ctx0, inp, n_patches, n_embd);
+        inp = ggml_cont(ctx0, ggml_transpose(ctx0, inp));
+    } else {
+        inp = ggml_reshape_3d(ctx0, inp, n_patches, n_embd, n_batch);
+        inp = ggml_cont_3d(ctx0, ggml_permute(ctx0, inp, 1, 0, 2, 3), n_embd, n_patches, n_batch);
+    }
     if (model.patch_bias) {
         inp = ggml_add(ctx0, inp, model.patch_bias);
         cb(inp, "patch_bias", -1);
@@ -839,11 +848,35 @@ ggml_tensor * clip_graph::build_patch_merge_permute(ggml_tensor * cur, int scale
     const int n_embd = cur->ne[0];
     int width  = img.nx() / patch_size;
     int height = img.ny() / patch_size;
+    const int64_t B = cur->ne[2];
 
     // pad width and height to factor
     const int64_t pad_width  = CLIP_ALIGN(width,  scale_factor) - width;
     const int64_t pad_height = CLIP_ALIGN(height, scale_factor) - height;
-    cur = ggml_reshape_3d(ctx0, cur, n_embd, width, height);
+
+    if (B == 1) {
+        cur = ggml_reshape_3d(ctx0, cur, n_embd, width, height);
+        if (pad_width || pad_height) {
+            cur     = ggml_pad(ctx0, cur, 0, pad_width, pad_height, 0);
+            width  += pad_width;
+            height += pad_height;
+        }
+
+        // unshuffle h
+        cur = ggml_reshape_3d(ctx0, cur, n_embd * scale_factor, width / scale_factor, height);
+        cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+
+        // unshuffle w
+        cur = ggml_cont_3d(ctx0, cur, n_embd * scale_factor * scale_factor, height / scale_factor, width / scale_factor);
+        cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+
+        cur = ggml_cont_2d(ctx0, cur, cur->ne[0], cur->ne[1] * cur->ne[2]);
+        cb(cur, "pixel_shuffle", -1);
+
+        return cur;
+    }
+
+    cur = ggml_reshape_4d(ctx0, cur, n_embd, width, height, B);
     if (pad_width || pad_height) {
         cur     = ggml_pad(ctx0, cur, 0, pad_width, pad_height, 0);
         width  += pad_width;
@@ -851,21 +884,43 @@ ggml_tensor * clip_graph::build_patch_merge_permute(ggml_tensor * cur, int scale
     }
 
     // unshuffle h
-    cur = ggml_reshape_3d(ctx0, cur, n_embd * scale_factor, width / scale_factor, height);
+    cur = ggml_reshape_4d(ctx0, cur, n_embd * scale_factor, width / scale_factor, height, B);
     cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
 
     // unshuffle w
-    cur = ggml_cont_3d(ctx0, cur, n_embd * scale_factor * scale_factor, height / scale_factor, width / scale_factor);
+    cur = ggml_cont_4d(ctx0, cur, n_embd * scale_factor * scale_factor, height / scale_factor, width / scale_factor, B);
     cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
 
-    cur = ggml_cont_2d(ctx0, cur, cur->ne[0], cur->ne[1] * cur->ne[2]);
+    cur = ggml_cont_3d(ctx0, cur, cur->ne[0], cur->ne[1] * cur->ne[2], B);
     cb(cur, "pixel_shuffle", -1);
 
     return cur;
 }
 
 static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const clip_image_f32_batch & imgs) {
-    const clip_image_f32 & img = imgs.entries[0];
+    clip_image_f32 graph_img;
+    const clip_image_f32 * graph_img_ptr = &imgs.entries[0];
+    const bool paddleocr_padded_batch =
+        ctx->proj_type() == PROJECTOR_TYPE_PADDLEOCR &&
+        getenv("LLAMA_EXPERIMENT_PADDLEOCR_PADDED_CLIP_BATCH") != nullptr &&
+        imgs.entries.size() > 1;
+
+    if (paddleocr_padded_batch) {
+        int max_nx = 0;
+        int max_ny = 0;
+        bool has_mixed_shapes = false;
+        for (const auto & entry : imgs.entries) {
+            max_nx = std::max(max_nx, entry.nx());
+            max_ny = std::max(max_ny, entry.ny());
+            has_mixed_shapes |= entry.nx() != imgs.entries[0].nx() || entry.ny() != imgs.entries[0].ny();
+        }
+        if (has_mixed_shapes) {
+            graph_img.set_size({ max_nx, max_ny }, true, false);
+            graph_img_ptr = &graph_img;
+        }
+    }
+
+    const clip_image_f32 & img = *graph_img_ptr;
     std::unique_ptr<clip_graph> builder;
 
     switch (ctx->proj_type()) {
@@ -1026,8 +1081,19 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
 
     // TODO [QWEN_VIDEO]: improve this in the future
     builder->n_batch = imgs.entries.size();
+    builder->paddleocr_padded_batch = paddleocr_padded_batch && graph_img_ptr == &graph_img;
+    if (builder->paddleocr_padded_batch) {
+        builder->batch_image_sizes.reserve(imgs.entries.size());
+        for (const auto & entry : imgs.entries) {
+            builder->batch_image_sizes.push_back(entry.get_size());
+        }
+    }
 
     return builder;
+}
+
+static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32_batch & imgs) {
+    return clip_get_graph_builder(ctx, imgs)->build();
 }
 
 //
@@ -1564,6 +1630,12 @@ struct clip_model_loader {
                         hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;
                         get_u32(KEY_IMAGE_MIN_PIXELS, hparams.image_min_pixels);
                         get_u32(KEY_IMAGE_MAX_PIXELS, hparams.image_max_pixels);
+                        if (const char * env = getenv("LLAMA_EXPERIMENT_PADDLEOCR_IMAGE_MIN_TOKENS")) {
+                            const int min_tokens = std::max(1, atoi(env));
+                            hparams.image_min_pixels = min_tokens * hparams.patch_size * hparams.patch_size;
+                            LOG_WRN("%s: experimental PaddleOCR image_min_pixels override: %d tokens -> %d pixels\n",
+                                    __func__, min_tokens, hparams.image_min_pixels);
+                        }
 
                         hparams.set_warmup_n_tokens(28*28); // avoid OOM on warmup
                     } break;
@@ -3540,6 +3612,31 @@ bool clip_image_encode(struct clip_ctx * ctx, int n_threads, const clip_image_f3
 bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32_batch * imgs_c_ptr, std::vector<float> & out_batch_embd) {
     const clip_image_f32_batch & imgs = *imgs_c_ptr;
     int n_batch_cur = imgs.entries.size();
+    const bool is_paddleocr = ctx->model.proj_type == PROJECTOR_TYPE_PADDLEOCR;
+    bool paddleocr_padded_batch =
+        is_paddleocr &&
+        getenv("LLAMA_EXPERIMENT_PADDLEOCR_PADDED_CLIP_BATCH") != nullptr &&
+        n_batch_cur > 1;
+    if (paddleocr_padded_batch) {
+        bool has_mixed_shapes = false;
+        for (int i = 1; i < n_batch_cur; ++i) {
+            has_mixed_shapes |= imgs.entries[i].nx() != imgs.entries[0].nx() || imgs.entries[i].ny() != imgs.entries[0].ny();
+        }
+        paddleocr_padded_batch = has_mixed_shapes;
+    }
+    const bool stage_timing = getenv("LLAMA_EXPERIMENT_CLIP_STAGE_TIMING") != nullptr;
+    const int64_t t_start_us = stage_timing ? ggml_time_us() : 0;
+    int64_t t_after_warmup_us = t_start_us;
+    int64_t t_after_reset_us = t_start_us;
+    int64_t t_after_build_us = t_start_us;
+    int64_t t_after_alloc_us = t_start_us;
+    int64_t t_raw_pack_us = 0;
+    int64_t t_raw_upload_us = 0;
+    int64_t t_after_projector_inputs_us = t_start_us;
+    int64_t t_after_set_threads_us = t_start_us;
+    int64_t t_after_compute_us = t_start_us;
+    int64_t t_after_shape_us = t_start_us;
+    int64_t t_after_readback_us = t_start_us;
 
     // [QWEN_VIDEO] for video models, the batch dimension is used as temporal dimension for merged frames
     if (!ctx->support_batch && n_batch_cur > clip_model_n_temporal_merge(ctx)) {
@@ -3551,18 +3648,36 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
     if (!ctx->is_allocated) {
         clip_model_loader::warmup(*ctx, *imgs_c_ptr);
     }
+    if (stage_timing) {
+        t_after_warmup_us = ggml_time_us();
+    }
 
     // build the inference graph
     ggml_backend_sched_reset(ctx->sched.get());
-    ggml_cgraph * gf = clip_get_graph_builder(ctx, imgs)->build();
+    if (stage_timing) {
+        t_after_reset_us = ggml_time_us();
+    }
+    ggml_cgraph * gf = clip_image_build_graph(ctx, imgs);
+    if (stage_timing) {
+        t_after_build_us = ggml_time_us();
+    }
     ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
+    if (stage_timing) {
+        t_after_alloc_us = ggml_time_us();
+    }
 
     // set inputs
     const auto & model   = ctx->model;
     const auto & hparams = model.hparams;
 
-    const int image_size_width  = imgs.entries[0].nx();
-    const int image_size_height = imgs.entries[0].ny();
+    int image_size_width  = imgs.entries[0].nx();
+    int image_size_height = imgs.entries[0].ny();
+    if (paddleocr_padded_batch) {
+        for (const auto & entry : imgs.entries) {
+            image_size_width  = std::max(image_size_width,  entry.nx());
+            image_size_height = std::max(image_size_height, entry.ny());
+        }
+    }
 
     const int patch_size    = hparams.patch_size;
     const int num_patches   = ((image_size_width / patch_size) * (image_size_height / patch_size));
@@ -3599,8 +3714,12 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
     // set input pixel values
     if (!imgs.is_audio) {
         size_t nelem = 0;
-        for (const auto & img : imgs.entries) {
-            nelem += img.nx() * img.ny() * 3;
+        if (paddleocr_padded_batch) {
+            nelem = (size_t) image_size_width * image_size_height * 3 * n_batch_cur;
+        } else {
+            for (const auto & img : imgs.entries) {
+                nelem += img.nx() * img.ny() * 3;
+            }
         }
         std::vector<float> inp_raw(nelem);
 
@@ -3618,17 +3737,19 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
         // IMPORTANT: [QWEN_VIDEO] the batch dim is currently used for temporal dim in Qwen-VL models
         // All entries must have the same spatial size (enforced by can_batch_with() during merging)
         {
-            const int nx = imgs.entries[0].nx();
-            const int ny = imgs.entries[0].ny();
+            const int64_t t_raw_pack_start_us = stage_timing ? ggml_time_us() : 0;
+            const int nx = image_size_width;
+            const int ny = image_size_height;
             const int n  = nx * ny;
 
             for (int b = 0; b < n_batch_cur; b++) {
-                LOG_DBG("%s: copying image %d/%d to input buffer (nx=%d, ny=%d)\n", __func__, b+1, n_batch_cur, nx, ny);
                 const auto & buf = imgs.entries[b].get_ro_buf();
+                const int src_nx = imgs.entries[b].nx();
+                const int src_ny = imgs.entries[b].ny();
                 float * batch_entry = inp_raw.data() + b * (3*n);
-                for (int y = 0; y < ny; y++) {
-                    for (int x = 0; x < nx; x++) {
-                        size_t base_src = 3*(y * nx + x);
+                for (int y = 0; y < src_ny; y++) {
+                    for (int x = 0; x < src_nx; x++) {
+                        size_t base_src = 3*(y * src_nx + x);
                         size_t base_dst =    y * nx + x;
                         batch_entry[      base_dst] = buf[base_src    ];
                         batch_entry[1*n + base_dst] = buf[base_src + 1];
@@ -3636,21 +3757,38 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
                     }
                 }
             }
+            if (stage_timing) {
+                t_raw_pack_us += ggml_time_us() - t_raw_pack_start_us;
+            }
         }
+        const int64_t t_raw_upload_start_us = stage_timing ? ggml_time_us() : 0;
         set_input_f32("inp_raw", inp_raw);
+        if (stage_timing) {
+            t_raw_upload_us += ggml_time_us() - t_raw_upload_start_us;
+        }
 
     } else {
         // audio input
         GGML_ASSERT(imgs.entries.size() == 1);
 
         const auto & mel_inp = imgs.entries[0];
+        const int64_t t_raw_pack_start_us = stage_timing ? ggml_time_us() : 0;
         const auto & buf = mel_inp.get_ro_buf();
         const int n_step = mel_inp.nx();
         const int n_mel  = mel_inp.ny();
         GGML_ASSERT((size_t)n_step * n_mel == buf.size());
+        if (stage_timing) {
+            t_raw_pack_us += ggml_time_us() - t_raw_pack_start_us;
+        }
 
+        const int64_t t_raw_upload_start_us = stage_timing ? ggml_time_us() : 0;
         set_input_f32("inp_raw", buf);
+        if (stage_timing) {
+            t_raw_upload_us += ggml_time_us() - t_raw_upload_start_us;
+        }
     }
+
+    const int64_t t_before_projector_inputs_us = stage_timing ? ggml_time_us() : 0;
 
     // set input per projector
     switch (ctx->model.proj_type) {
@@ -3844,6 +3982,21 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
                 }
 
                 set_input_i32("positions", positions);
+
+                if (paddleocr_padded_batch) {
+                    std::vector<float> mask((size_t) num_patches * num_patches * n_batch_cur, std::numeric_limits<float>::lowest());
+                    for (int b = 0; b < n_batch_cur; ++b) {
+                        const int valid_pw = imgs.entries[b].nx() / patch_size;
+                        const int valid_ph = imgs.entries[b].ny() / patch_size;
+                        for (int q = 0; q < num_patches; ++q) {
+                            float * row = mask.data() + (size_t) b * num_patches * num_patches + (size_t) q * num_patches;
+                            for (int y = 0; y < valid_ph; ++y) {
+                                std::fill(row + y * pw, row + y * pw + valid_pw, 0.0f);
+                            }
+                        }
+                    }
+                    set_input_f32("paddleocr_attn_mask", mask);
+                }
             } break;
         case PROJECTOR_TYPE_DOTS_OCR:
             {
@@ -4438,6 +4591,9 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
         default:
             GGML_ABORT("Unknown projector type");
     }
+    if (stage_timing) {
+        t_after_projector_inputs_us = ggml_time_us();
+    }
 
     // ggml_backend_cpu_set_n_threads(ctx->backend_cpu, n_threads);
     ggml_backend_dev_t dev = ggml_backend_get_device(ctx->backend_cpu);
@@ -4448,8 +4604,14 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
             ggml_backend_set_n_threads_fn(ctx->backend_cpu, n_threads);
         }
     }
+    if (stage_timing) {
+        t_after_set_threads_us = ggml_time_us();
+    }
 
     auto status = ggml_backend_sched_graph_compute(ctx->sched.get(), gf);
+    if (stage_timing) {
+        t_after_compute_us = ggml_time_us();
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LOG_ERR("%s: ggml_backend_sched_graph_compute failed with error %d\n", __func__, status);
         return false;
@@ -4458,27 +4620,111 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
     // the last node is the embedding tensor
     ggml_tensor * embeddings = ggml_graph_node(gf, -1);
 
-    // sanity check (assuming that all images in batch have the same number of tokens, so we only check the first one)
-    const int n_tokens_out = embeddings->ne[1];
-    const int expected_n_tokens_out = clip_n_output_tokens(ctx, &imgs.entries[0]);
-    if (n_tokens_out != expected_n_tokens_out) {
-        LOG_ERR("%s: expected output %d tokens, got %d\n", __func__, expected_n_tokens_out, n_tokens_out);
-        GGML_ABORT("Invalid number of output tokens");
+    const int64_t n_tokens_out_total = embeddings->ne[0] == 0 ? 0 : ggml_nelements(embeddings) / embeddings->ne[0];
+    int64_t expected_n_tokens_out_total = 0;
+    for (const auto & entry : imgs.entries) {
+        expected_n_tokens_out_total += clip_n_output_tokens(ctx, &entry);
+    }
+    const int merge = hparams.n_merge > 0 ? hparams.n_merge : 1;
+    const int padded_tokens_x = image_size_width  / patch_size / merge;
+    const int padded_tokens_y = image_size_height / patch_size / merge;
+    const int64_t padded_expected_n_tokens_out_total =
+        (int64_t) padded_tokens_x * padded_tokens_y * n_batch_cur;
+
+    if (ctx->model.proj_type == PROJECTOR_TYPE_PADDLEOCR && n_batch_cur > 1) {
+        LOG_INF("%s: PaddleOCR batch encode n_batch=%d, embeddings=[%lld,%lld,%lld,%lld], output_tokens=%lld, expected_tokens=%lld, padded_expected_tokens=%lld, padded=%d, nbytes=%zu\n",
+                __func__, n_batch_cur,
+                (long long) embeddings->ne[0], (long long) embeddings->ne[1],
+                (long long) embeddings->ne[2], (long long) embeddings->ne[3],
+                (long long) n_tokens_out_total, (long long) expected_n_tokens_out_total,
+                (long long) padded_expected_n_tokens_out_total,
+                paddleocr_padded_batch ? 1 : 0,
+                ggml_nbytes(embeddings));
     }
 
-    LOG_DBG("%s: output embedding shape [%d, %d, %d]\n", __func__,
-        (int)embeddings->ne[0], (int)embeddings->ne[1], (int)embeddings->ne[2]);
+    if (!paddleocr_padded_batch && n_tokens_out_total != expected_n_tokens_out_total) {
+        LOG_ERR("%s: expected output %lld tokens, got %lld\n",
+            __func__, (long long) expected_n_tokens_out_total, (long long) n_tokens_out_total);
+        GGML_ABORT("Invalid number of output tokens");
+    }
+    if (paddleocr_padded_batch && n_tokens_out_total != padded_expected_n_tokens_out_total) {
+        LOG_ERR("%s: expected padded output %lld tokens, got %lld\n",
+            __func__, (long long) padded_expected_n_tokens_out_total, (long long) n_tokens_out_total);
+        GGML_ABORT("Invalid number of padded output tokens");
+    }
+    if (stage_timing) {
+        t_after_shape_us = ggml_time_us();
+    }
 
     // copy output to user buffer if provided
     // if output is empty, skip the copy
     if (!out_batch_embd.empty()) {
-        if (out_batch_embd.size() != (size_t)ggml_nelements(embeddings)) {
-            LOG_ERR("%s: output buffer has %zu elements but expected %zu\n", __func__, out_batch_embd.size(), (size_t)ggml_nelements(embeddings));
-            GGML_ABORT("Output buffer size mismatch");
+        const int64_t t_readback_start_us = stage_timing ? ggml_time_us() : 0;
+        if (paddleocr_padded_batch) {
+            const size_t expected_out = (size_t) expected_n_tokens_out_total * (size_t) embeddings->ne[0];
+            if (out_batch_embd.size() != expected_out) {
+                LOG_ERR("%s: output buffer has %zu elements but expected %zu\n", __func__, out_batch_embd.size(), expected_out);
+                GGML_ABORT("Output buffer size mismatch");
+            }
+            std::vector<float> padded_embd(ggml_nelements(embeddings));
+            ggml_backend_tensor_get(embeddings, padded_embd.data(), 0, ggml_nbytes(embeddings));
+            const int64_t n_embd_out = embeddings->ne[0];
+            const int64_t n_tokens_per_padded_image = padded_tokens_x * padded_tokens_y;
+            int64_t dst_token = 0;
+            for (int b = 0; b < n_batch_cur; ++b) {
+                const int valid_tokens_x = clip_n_output_tokens_x(ctx, &imgs.entries[b]);
+                const int valid_tokens_y = clip_n_output_tokens_y(ctx, &imgs.entries[b]);
+                for (int y = 0; y < valid_tokens_y; ++y) {
+                    for (int x = 0; x < valid_tokens_x; ++x) {
+                        const int64_t src_token = (int64_t) b * n_tokens_per_padded_image + y * padded_tokens_x + x;
+                        std::memcpy(
+                            out_batch_embd.data() + dst_token * n_embd_out,
+                            padded_embd.data() + src_token * n_embd_out,
+                            n_embd_out * sizeof(float));
+                        dst_token++;
+                    }
+                }
+            }
+            GGML_ASSERT(dst_token == expected_n_tokens_out_total);
+        } else {
+            if (out_batch_embd.size() != (size_t)ggml_nelements(embeddings)) {
+                LOG_ERR("%s: output buffer has %zu elements but expected %zu\n", __func__, out_batch_embd.size(), (size_t)ggml_nelements(embeddings));
+                GGML_ABORT("Output buffer size mismatch");
+            }
+            ggml_backend_tensor_get(embeddings, out_batch_embd.data(), 0, ggml_nbytes(embeddings));
         }
-        ggml_backend_tensor_get(embeddings, out_batch_embd.data(), 0, ggml_nbytes(embeddings));
+        if (stage_timing) {
+            t_after_shape_us = t_readback_start_us;
+            t_after_readback_us = ggml_time_us();
+        }
+    } else if (stage_timing) {
+        t_after_readback_us = t_after_shape_us;
     } else {
         LOG_WRN("%s: output buffer is empty, skipping copy\n", __func__);
+    }
+
+    if (stage_timing) {
+        auto us_to_ms = [](int64_t us) -> double { return (double) us / 1000.0; };
+        const int64_t t_end_us = t_after_readback_us;
+        LOG_INF("%s: stage timing n_batch=%d image=%dx%d nodes=%d tokens=%lld warmup=%.3f reset=%.3f build=%.3f alloc=%.3f raw_pack=%.3f raw_upload=%.3f projector_inputs=%.3f set_threads=%.3f compute=%.3f shape=%.3f readback=%.3f total=%.3f ms\n",
+                __func__,
+                n_batch_cur,
+                image_size_width,
+                image_size_height,
+                ggml_graph_n_nodes(gf),
+                (long long) n_tokens_out_total,
+                us_to_ms(t_after_warmup_us - t_start_us),
+                us_to_ms(t_after_reset_us - t_after_warmup_us),
+                us_to_ms(t_after_build_us - t_after_reset_us),
+                us_to_ms(t_after_alloc_us - t_after_build_us),
+                us_to_ms(t_raw_pack_us),
+                us_to_ms(t_raw_upload_us),
+                us_to_ms(t_after_projector_inputs_us - t_before_projector_inputs_us),
+                us_to_ms(t_after_set_threads_us - t_after_projector_inputs_us),
+                us_to_ms(t_after_compute_us - t_after_set_threads_us),
+                us_to_ms(t_after_shape_us - t_after_compute_us),
+                us_to_ms(t_after_readback_us - t_after_shape_us),
+                us_to_ms(t_end_us - t_start_us));
     }
 
     // Debug: dump final embeddings if MTMD_DEBUG_EMBEDDINGS is set
@@ -4635,6 +4881,14 @@ int clip_model_n_temporal_merge(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_QWEN25VL:
         case PROJECTOR_TYPE_QWEN3VL:
             return 2;
+        case PROJECTOR_TYPE_PADDLEOCR:
+            {
+                const char * env = getenv("LLAMA_EXPERIMENT_PADDLEOCR_CLIP_BATCH_MAX");
+                if (!env) {
+                    return 1;
+                }
+                return std::max(1, atoi(env));
+            }
         default:
             return 1;
     }

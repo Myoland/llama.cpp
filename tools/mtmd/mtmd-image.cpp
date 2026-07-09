@@ -2,7 +2,150 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <vector>
+
+//
+// base implementation
+//
+
+static thread_local int mtmd_thread_image_min_tokens_override = -1;
+static thread_local int mtmd_thread_image_max_tokens_override = -1;
+
+int mtmd_image_set_thread_min_tokens_override(int image_min_tokens) {
+    const int previous = mtmd_thread_image_min_tokens_override;
+    mtmd_thread_image_min_tokens_override = image_min_tokens;
+    return previous;
+}
+
+int mtmd_image_get_thread_min_tokens_override() {
+    return mtmd_thread_image_min_tokens_override;
+}
+
+int mtmd_image_set_thread_max_tokens_override(int image_max_tokens) {
+    const int previous = mtmd_thread_image_max_tokens_override;
+    mtmd_thread_image_max_tokens_override = image_max_tokens;
+    return previous;
+}
+
+int mtmd_image_get_thread_max_tokens_override() {
+    return mtmd_thread_image_max_tokens_override;
+}
+
+static bool mtmd_paddleocr_adaptive_min_pixels(
+        const clip_hparams & hparams,
+        const clip_image_size & original_size,
+        int & min_pixels_out) {
+    const char * min_tokens_env = getenv("LLAMA_EXPERIMENT_PADDLEOCR_ADAPTIVE_MIN_TOKENS");
+    const char * rules_env      = getenv("LLAMA_EXPERIMENT_PADDLEOCR_ADAPTIVE_RULES");
+    if (min_tokens_env == nullptr || rules_env == nullptr || rules_env[0] == '\0') {
+        return false;
+    }
+
+    char * end = nullptr;
+    const long min_tokens = std::strtol(min_tokens_env, &end, 10);
+    if (end == min_tokens_env || min_tokens <= 0) {
+        return false;
+    }
+
+    const double area   = (double) original_size.width * (double) original_size.height;
+    const double aspect = original_size.height > 0 ? (double) original_size.width / (double) original_size.height : 0.0;
+
+    const char * cur = rules_env;
+    while (*cur != '\0') {
+        double area_min = 0.0;
+        double area_max = 0.0;
+        double aspect_min = 0.0;
+        double aspect_max = 0.0;
+        char * next = nullptr;
+
+        area_min = std::strtod(cur, &next);
+        if (next == cur || *next != ':') {
+            break;
+        }
+        cur = next + 1;
+
+        area_max = std::strtod(cur, &next);
+        if (next == cur || *next != ':') {
+            break;
+        }
+        cur = next + 1;
+
+        aspect_min = std::strtod(cur, &next);
+        if (next == cur || *next != ':') {
+            break;
+        }
+        cur = next + 1;
+
+        aspect_max = std::strtod(cur, &next);
+        if (next == cur) {
+            break;
+        }
+
+        if (area >= area_min && area <= area_max && aspect >= aspect_min && aspect <= aspect_max) {
+            const int patch_area = hparams.patch_size * hparams.patch_size;
+            min_pixels_out = (int) min_tokens * patch_area;
+            return true;
+        }
+
+        cur = next;
+        if (*cur == ';') {
+            ++cur;
+        } else if (*cur != '\0') {
+            break;
+        }
+    }
+
+    return false;
+}
+
+static clip_image_size mtmd_paddleocr_bucket_target_size(
+        const clip_image_size & target_size,
+        int align_size,
+        int min_pixels,
+        int max_pixels) {
+    const char * bucket_step_env = getenv("LLAMA_EXPERIMENT_PADDLEOCR_SHAPE_BUCKET_STEP");
+    if (bucket_step_env == nullptr || bucket_step_env[0] == '\0') {
+        return target_size;
+    }
+
+    char * end = nullptr;
+    const long bucket_step = std::strtol(bucket_step_env, &end, 10);
+    if (end == bucket_step_env || bucket_step <= 1 || align_size <= 0 || max_pixels <= 0) {
+        return target_size;
+    }
+
+    const int bucket = align_size * (int) bucket_step;
+    auto ceil_by_bucket = [bucket](int x) {
+        return std::max(bucket, ((x + bucket - 1) / bucket) * bucket);
+    };
+    auto floor_by_bucket = [bucket](int x) {
+        return std::max(bucket, (x / bucket) * bucket);
+    };
+    auto nearest_by_bucket = [&](int x) {
+        const int lo = floor_by_bucket(x);
+        const int hi = ceil_by_bucket(x);
+        return (x - lo) <= (hi - x) ? lo : hi;
+    };
+
+    const char * mode = getenv("LLAMA_EXPERIMENT_PADDLEOCR_SHAPE_BUCKET_MODE");
+    clip_image_size bucketed;
+    if (mode && std::strcmp(mode, "floor") == 0) {
+        bucketed = { floor_by_bucket(target_size.width), floor_by_bucket(target_size.height) };
+    } else if (mode && std::strcmp(mode, "nearest") == 0) {
+        bucketed = { nearest_by_bucket(target_size.width), nearest_by_bucket(target_size.height) };
+    } else {
+        bucketed = { ceil_by_bucket(target_size.width), ceil_by_bucket(target_size.height) };
+    }
+
+    const int64_t bucketed_area = (int64_t) bucketed.width * (int64_t) bucketed.height;
+    if (bucketed_area < min_pixels || bucketed_area > max_pixels) {
+        return target_size;
+    }
+
+    return bucketed;
+}
 
 void mtmd_image_preproc_out::append(const clip_hparams & hparams, const clip_image_u8 & img, bool normalized) {
     clip_image_f32 dst;
@@ -894,12 +1037,38 @@ mtmd_image_preproc_out mtmd_image_preprocessor_dyn_size::preprocess(const clip_i
     clip_image_u8 resized_image;
     const clip_image_size original_size = img.get_size();
     // the original pixtral model doesn't have n_merge
-    const int cur_merge = hparams.n_merge;
-    const clip_image_size target_size = img_tool::calc_size_preserved_ratio(
+    const int cur_merge = hparams.n_merge == 0 ? 1 : hparams.n_merge;
+    int image_min_pixels = hparams.image_min_pixels;
+    int image_max_pixels = hparams.image_max_pixels;
+    const int thread_min_tokens_override = mtmd_image_get_thread_min_tokens_override();
+    if (thread_min_tokens_override > 0) {
+        image_min_pixels = std::min(
+            thread_min_tokens_override * hparams.patch_size * hparams.patch_size,
+            image_max_pixels);
+    }
+    const int thread_max_tokens_override = mtmd_image_get_thread_max_tokens_override();
+    if (thread_max_tokens_override > 0) {
+        image_max_pixels = std::min(
+            std::max(
+                thread_max_tokens_override * hparams.patch_size * hparams.patch_size,
+                hparams.patch_size * hparams.patch_size),
+            hparams.image_max_pixels);
+    }
+    int adaptive_min_pixels = 0;
+    if (thread_min_tokens_override <= 0 && mtmd_paddleocr_adaptive_min_pixels(hparams, original_size, adaptive_min_pixels)) {
+        image_min_pixels = std::min(adaptive_min_pixels, image_max_pixels);
+    }
+    image_min_pixels = std::min(image_min_pixels, image_max_pixels);
+    clip_image_size target_size = img_tool::calc_size_preserved_ratio(
         original_size,
         hparams.patch_size * cur_merge,
-        hparams.image_min_pixels,
-        hparams.image_max_pixels);
+        image_min_pixels,
+        image_max_pixels);
+    target_size = mtmd_paddleocr_bucket_target_size(
+        target_size,
+        hparams.patch_size * cur_merge,
+        image_min_pixels,
+        image_max_pixels);
     img_tool::resize(img, resized_image, target_size,
                         hparams.image_resize_algo,
                         hparams.image_resize_pad,

@@ -22,6 +22,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <climits>
+#include <limits>
+#include <numeric>
 #include <vector>
 
 // for still image data, layout is RGBRGBRGB...
@@ -226,6 +228,24 @@ enum mtmd_slice_tmpl {
 
 const char * mtmd_default_marker() {
     return "<__media__>";
+}
+
+static int mtmd_clip_batch_max(const clip_ctx * ctx) {
+    if (clip_get_projector_type(ctx) != PROJECTOR_TYPE_PADDLEOCR) {
+        return std::max(1, clip_model_n_temporal_merge(ctx));
+    }
+
+    const char * env = getenv("LLAMA_EXPERIMENT_PADDLEOCR_CLIP_BATCH_MAX");
+    if (env == nullptr || env[0] == '\0') {
+        return 1;
+    }
+
+    char * end = nullptr;
+    const long value = std::strtol(env, &end, 10);
+    if (end == env || value <= 0) {
+        return 1;
+    }
+    return (int) std::min(value, (long) INT_MAX);
 }
 
 static clip_flash_attn_type mtmd_get_clip_flash_attn_type(enum llama_flash_attn_type flash_attn_type) {
@@ -922,11 +942,13 @@ struct mtmd_tokenizer {
         // [QWEN_VIDEO] handle frame merging for models that support it (i.e. qwen-vl)
         int n_merge_frames = 1;
         if (ctx->ctx_v) {
-            n_merge_frames = clip_model_n_temporal_merge(ctx->ctx_v);
-            GGML_ASSERT(n_merge_frames <= 2 && "we only support merging maximum 2 images for now; open an issue if this model supports merging more");
+            n_merge_frames = mtmd_clip_batch_max(ctx->ctx_v);
+            if (ctx->proj_type_v() != PROJECTOR_TYPE_PADDLEOCR) {
+                n_merge_frames = std::min(n_merge_frames, 2);
+            }
         }
 
-        // Build merged_bitmaps: each entry is a group of 1 or 2 bitmaps.
+        // Build merged_bitmaps: each entry is a group of merge-compatible bitmaps.
         // For consecutive mergeable bitmap parts, merge them and collapse the second part out of this->parts.
         std::vector<std::vector<const mtmd_bitmap *>> merged_bitmaps;
         if (n_merge_frames > 1) {
@@ -934,18 +956,25 @@ struct mtmd_tokenizer {
                 if (parts[i].bitmap == nullptr) {
                     continue;
                 }
-                if (i + 1 < parts.size() && parts[i + 1].bitmap != nullptr) {
-                    const mtmd_bitmap * bm_a = parts[i].bitmap;
-                    const mtmd_bitmap * bm_b = parts[i + 1].bitmap;
-                    if (bm_a->can_merge_with(*bm_b)) {
-                        LOG_DBG("%s: merging 2 frames at part index %zu and %zu\n", __func__, i, i + 1);
-                        merged_bitmaps.push_back({bm_a, bm_b});
-                        parts.erase(parts.begin() + i + 1); // collapse the second bitmap part
-                        continue;
+                const mtmd_bitmap * bm_a = parts[i].bitmap;
+                std::vector<const mtmd_bitmap *> group = { bm_a };
+                size_t j = i + 1;
+                while (group.size() < (size_t) n_merge_frames && j < parts.size() && parts[j].bitmap != nullptr) {
+                    const mtmd_bitmap * bm_b = parts[j].bitmap;
+                    if (!bm_a->can_merge_with(*bm_b)) {
+                        break;
                     }
+                    group.push_back(bm_b);
+                    ++j;
+                }
+                if (group.size() > 1) {
+                    LOG_DBG("%s: merging %zu frames at part index %zu..%zu\n", __func__, group.size(), i, j - 1);
+                    merged_bitmaps.push_back(std::move(group));
+                    parts.erase(parts.begin() + i + 1, parts.begin() + j); // collapse merged bitmap parts
+                    continue;
                 }
                 LOG_DBG("%s: no merging for part index %zu\n", __func__, i);
-                merged_bitmaps.push_back({parts[i].bitmap});
+                merged_bitmaps.push_back({bm_a});
             }
         } else {
             for (const auto & p : parts) {
@@ -1183,9 +1212,14 @@ struct mtmd_tokenizer {
                 }
 
                 size_t n_tokens = 0;
+                const projector_type proj_type = ctx->proj_type_v();
+                const bool qwen_video_pair =
+                    proj_type == PROJECTOR_TYPE_QWEN2VL ||
+                    proj_type == PROJECTOR_TYPE_QWEN25VL ||
+                    proj_type == PROJECTOR_TYPE_QWEN3VL;
                 for (auto & e : preproc_out.entries) {
                     n_tokens += clip_n_output_tokens(ctx->ctx_v, &e);
-                    if (clip_model_n_temporal_merge(ctx->ctx_v) == 2) {
+                    if (qwen_video_pair && clip_model_n_temporal_merge(ctx->ctx_v) == 2) {
                         // [QWEN_VIDEO] pair input is merged to the same embd, so only count as one image
                         break;
                     }
@@ -1509,6 +1543,254 @@ static int32_t mtmd_encode_chunk_impl(mtmd_context * ctx, const mtmd_input_chunk
     return 1;
 }
 
+int32_t mtmd_encode_image_chunks(
+        mtmd_context * ctx,
+        const mtmd_input_chunk * const * chunks,
+        size_t n_chunks,
+        size_t * token_offsets,
+        size_t * n_tokens_out) {
+    if (n_chunks == 0) {
+        ctx->out_embd.clear();
+        return 0;
+    }
+
+    if (!ctx->ctx_v) {
+        LOG_ERR("%s: model does not support vision input\n", __func__);
+        return 1;
+    }
+
+    clip_ctx * ctx_clip = ctx->ctx_v;
+    const auto proj_type = clip_get_projector_type(ctx_clip);
+    const int n_mmproj_embd = clip_n_mmproj_embd(ctx_clip);
+
+    std::vector<size_t> chunk_offsets(n_chunks);
+    std::vector<size_t> chunk_tokens(n_chunks);
+    std::vector<const clip_image_f32 *> batch_entries(n_chunks, nullptr);
+
+    bool can_batch = proj_type == PROJECTOR_TYPE_PADDLEOCR;
+    size_t n_not_single_entry = 0;
+    size_t n_token_mismatch = 0;
+    size_t n_tokens_total = 0;
+    for (size_t i = 0; i < n_chunks; ++i) {
+        const mtmd_input_chunk * chunk = chunks[i];
+        if (!chunk || chunk->type != MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+            LOG_ERR("%s: chunk %zu is not an image chunk\n", __func__, i);
+            return 1;
+        }
+        if (chunk->tokens_image == nullptr) {
+            LOG_ERR("%s: image tokens are null for chunk %zu\n", __func__, i);
+            return 1;
+        }
+        if (chunk->tokens_image->is_placeholder()) {
+            LOG_ERR("%s: image tokens batch is placeholder for chunk %zu\n", __func__, i);
+            return 1;
+        }
+
+        const size_t n_tokens = chunk->tokens_image->n_tokens();
+        chunk_offsets[i] = n_tokens_total;
+        chunk_tokens[i] = n_tokens;
+        if (token_offsets) {
+            token_offsets[i] = n_tokens_total;
+        }
+        if (n_tokens_out) {
+            n_tokens_out[i] = n_tokens;
+        }
+        n_tokens_total += n_tokens;
+
+        if (can_batch) {
+            const auto & entries = chunk->tokens_image->batch_f32.entries;
+            if (entries.size() != 1) {
+                n_not_single_entry++;
+                can_batch = false;
+            } else {
+                const clip_image_f32 * entry = &entries[0];
+                if (clip_n_output_tokens(ctx_clip, entry) != (int) n_tokens) {
+                    n_token_mismatch++;
+                    can_batch = false;
+                } else {
+                    batch_entries[i] = entry;
+                }
+            }
+        }
+    }
+
+    auto encode_sequential = [&]() -> int32_t {
+        std::vector<float> output(n_tokens_total * n_mmproj_embd);
+        for (size_t i = 0; i < n_chunks; ++i) {
+            const int32_t ret = mtmd_encode_chunk_impl(ctx, chunks[i], ctx->out_embd);
+            if (ret != 0) {
+                return ret;
+            }
+
+            const float * embd = ctx->out_embd.data();
+            if (!embd) {
+                LOG_ERR("%s: failed to get sequential image embeddings for chunk %zu\n", __func__, i);
+                return 1;
+            }
+
+            std::memcpy(
+                output.data() + chunk_offsets[i] * n_mmproj_embd,
+                embd,
+                chunk_tokens[i] * n_mmproj_embd * sizeof(float));
+        }
+
+        ctx->out_embd = std::move(output);
+        return 0;
+    };
+
+    const int n_batch_max = mtmd_clip_batch_max(ctx_clip);
+    if (!can_batch || n_batch_max <= 1) {
+        if (const char * env = getenv("LLAMA_EXPERIMENT_PADDLEOCR_CLIP_BATCH_MAX")) {
+            LOG_WRN("%s: falling back to sequential image encode, chunks=%zu, proj_type=%d, batch_max=%d, not_single_entry=%zu, token_mismatch=%zu, env_batch_max=%s\n",
+                    __func__, n_chunks, (int) proj_type, n_batch_max, n_not_single_entry, n_token_mismatch, env);
+        }
+        return encode_sequential();
+    }
+
+    struct encode_group {
+        int nx;
+        int ny;
+        size_t orig_tokens;
+        std::vector<size_t> indices;
+    };
+
+    std::vector<encode_group> groups;
+    const bool padded_clip_batch = getenv("LLAMA_EXPERIMENT_PADDLEOCR_PADDED_CLIP_BATCH") != nullptr;
+    double padded_overhead_max = 1.35;
+    if (const char * env = getenv("LLAMA_EXPERIMENT_PADDLEOCR_PADDED_CLIP_OVERHEAD_MAX")) {
+        padded_overhead_max = std::max(1.0, atof(env));
+    }
+
+    auto output_tokens_for_size = [&](int nx, int ny) -> size_t {
+        clip_image_f32 fake;
+        fake.set_size({ nx, ny }, true, false);
+        return (size_t) clip_n_output_tokens(ctx_clip, &fake);
+    };
+
+    if (padded_clip_batch) {
+        std::vector<size_t> order(n_chunks);
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            return chunk_tokens[a] > chunk_tokens[b];
+        });
+
+        for (size_t idx : order) {
+            const clip_image_f32 * entry = batch_entries[idx];
+            GGML_ASSERT(entry != nullptr);
+
+            size_t best_group = std::numeric_limits<size_t>::max();
+            double best_overhead = std::numeric_limits<double>::infinity();
+            for (size_t gi = 0; gi < groups.size(); ++gi) {
+                auto & group = groups[gi];
+                if (group.indices.size() >= (size_t) n_batch_max) {
+                    continue;
+                }
+                const int nx = std::max(group.nx, entry->nx());
+                const int ny = std::max(group.ny, entry->ny());
+                const size_t padded_tokens = output_tokens_for_size(nx, ny) * (group.indices.size() + 1);
+                const size_t orig_tokens = group.orig_tokens + chunk_tokens[idx];
+                const double overhead = orig_tokens == 0 ? std::numeric_limits<double>::infinity() : (double) padded_tokens / (double) orig_tokens;
+                if (overhead <= padded_overhead_max && overhead < best_overhead) {
+                    best_group = gi;
+                    best_overhead = overhead;
+                }
+            }
+
+            if (best_group == std::numeric_limits<size_t>::max()) {
+                groups.push_back({ entry->nx(), entry->ny(), chunk_tokens[idx], { idx } });
+            } else {
+                auto & group = groups[best_group];
+                group.nx = std::max(group.nx, entry->nx());
+                group.ny = std::max(group.ny, entry->ny());
+                group.orig_tokens += chunk_tokens[idx];
+                group.indices.push_back(idx);
+            }
+        }
+    } else {
+        for (size_t i = 0; i < n_chunks; ++i) {
+            const clip_image_f32 * entry = batch_entries[i];
+            GGML_ASSERT(entry != nullptr);
+            auto it = std::find_if(groups.begin(), groups.end(), [&](const encode_group & group) {
+                return group.nx == entry->nx() && group.ny == entry->ny();
+            });
+            if (it == groups.end()) {
+                groups.push_back({ entry->nx(), entry->ny(), chunk_tokens[i], { i } });
+            } else {
+                it->orig_tokens += chunk_tokens[i];
+                it->indices.push_back(i);
+            }
+        }
+    }
+
+    if (const char * env = getenv("LLAMA_EXPERIMENT_PADDLEOCR_CLIP_BATCH_MAX")) {
+        size_t n_multi_groups = 0;
+        size_t n_max_group = 0;
+        size_t n_padded_groups = 0;
+        for (const auto & group : groups) {
+            if (group.indices.size() > 1) {
+                n_multi_groups++;
+            }
+            if (padded_clip_batch && group.indices.size() > 1) {
+                const size_t padded_tokens = output_tokens_for_size(group.nx, group.ny) * group.indices.size();
+                if (padded_tokens > group.orig_tokens) {
+                    n_padded_groups++;
+                }
+            }
+            n_max_group = std::max(n_max_group, group.indices.size());
+        }
+        LOG_WRN("%s: PaddleOCR cross-slot batch encode chunks=%zu, groups=%zu, multi_groups=%zu, padded_groups=%zu, max_group=%zu, batch_max=%d, padded=%d, overhead_max=%.3f, env_batch_max=%s\n",
+                __func__, n_chunks, groups.size(), n_multi_groups, n_padded_groups, n_max_group,
+                n_batch_max, padded_clip_batch ? 1 : 0, padded_overhead_max, env);
+    }
+
+    ctx->out_embd.resize(n_tokens_total * n_mmproj_embd);
+
+    for (const auto & group : groups) {
+        size_t i = 0;
+        while (i < group.indices.size()) {
+            const size_t n_cur = std::min((size_t) n_batch_max, group.indices.size() - i);
+            size_t n_tokens_group = 0;
+            for (size_t j = 0; j < n_cur; ++j) {
+                n_tokens_group += chunk_tokens[group.indices[i + j]];
+            }
+
+            std::vector<float> group_embd(n_tokens_group * n_mmproj_embd);
+
+            clip_image_f32_batch batch_f32;
+            batch_f32.is_audio = false;
+            batch_f32.entries.reserve(n_cur);
+            for (size_t j = 0; j < n_cur; ++j) {
+                batch_f32.entries.emplace_back(*batch_entries[group.indices[i + j]]);
+            }
+
+            bool ok = clip_image_batch_encode(
+                ctx_clip,
+                ctx->n_threads,
+                &batch_f32,
+                group_embd);
+
+            if (!ok) {
+                LOG_WRN("%s: batched image encode failed, falling back to sequential encode\n", __func__);
+                return encode_sequential();
+            }
+
+            size_t group_token_offset = 0;
+            for (size_t j = 0; j < n_cur; ++j) {
+                const size_t idx = group.indices[i + j];
+                std::memcpy(
+                    ctx->out_embd.data() + chunk_offsets[idx] * n_mmproj_embd,
+                    group_embd.data() + group_token_offset * n_mmproj_embd,
+                    chunk_tokens[idx] * n_mmproj_embd * sizeof(float));
+                group_token_offset += chunk_tokens[idx];
+            }
+
+            i += n_cur;
+        }
+    }
+
+    return 0;
+}
+
 int32_t mtmd_encode_chunk(mtmd_context * ctx, const mtmd_input_chunk * chunk) {
     // this is the non-batching version
     try {
@@ -1676,7 +1958,7 @@ bool mtmd_decode_use_non_causal(const mtmd_context * ctx, const mtmd_input_chunk
 }
 
 bool mtmd_decode_use_mrope(const mtmd_context * ctx) {
-    return ctx->pos_type == MTMD_POS_TYPE_MROPE;
+    return ctx->pos_type == MTMD_POS_TYPE_MROPE || ctx->pos_type == MTMD_POS_TYPE_HUNYUANVL;
 }
 
 bool mtmd_support_vision(const mtmd_context * ctx) {
