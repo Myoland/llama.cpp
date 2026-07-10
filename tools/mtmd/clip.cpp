@@ -1632,7 +1632,10 @@ struct clip_model_loader {
                         get_u32(KEY_IMAGE_MAX_PIXELS, hparams.image_max_pixels);
                         if (const char * env = getenv("LLAMA_EXPERIMENT_PADDLEOCR_IMAGE_MIN_TOKENS")) {
                             const int min_tokens = std::max(1, atoi(env));
-                            hparams.image_min_pixels = min_tokens * hparams.patch_size * hparams.patch_size;
+                            // one output token covers (patch_size * n_merge)^2 pixels
+                            hparams.image_min_pixels = min_tokens
+                                * hparams.patch_size * hparams.n_merge
+                                * hparams.patch_size * hparams.n_merge;
                             LOG_WRN("%s: experimental PaddleOCR image_min_pixels override: %d tokens -> %d pixels\n",
                                     __func__, min_tokens, hparams.image_min_pixels);
                         }

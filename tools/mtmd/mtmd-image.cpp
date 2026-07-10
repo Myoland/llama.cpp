@@ -84,8 +84,10 @@ static bool mtmd_paddleocr_adaptive_min_pixels(
         }
 
         if (area >= area_min && area <= area_max && aspect >= aspect_min && aspect <= aspect_max) {
-            const int patch_area = hparams.patch_size * hparams.patch_size;
-            min_pixels_out = (int) min_tokens * patch_area;
+            // one output token covers (patch_size * n_merge)^2 pixels
+            const int merge = hparams.n_merge == 0 ? 1 : hparams.n_merge;
+            const int token_area = hparams.patch_size * merge * hparams.patch_size * merge;
+            min_pixels_out = (int) min_tokens * token_area;
             return true;
         }
 
@@ -1040,18 +1042,18 @@ mtmd_image_preproc_out mtmd_image_preprocessor_dyn_size::preprocess(const clip_i
     const int cur_merge = hparams.n_merge == 0 ? 1 : hparams.n_merge;
     int image_min_pixels = hparams.image_min_pixels;
     int image_max_pixels = hparams.image_max_pixels;
+    // one output token covers (patch_size * n_merge)^2 pixels
+    const int token_area = hparams.patch_size * cur_merge * hparams.patch_size * cur_merge;
     const int thread_min_tokens_override = mtmd_image_get_thread_min_tokens_override();
     if (thread_min_tokens_override > 0) {
         image_min_pixels = std::min(
-            thread_min_tokens_override * hparams.patch_size * hparams.patch_size,
+            thread_min_tokens_override * token_area,
             image_max_pixels);
     }
     const int thread_max_tokens_override = mtmd_image_get_thread_max_tokens_override();
     if (thread_max_tokens_override > 0) {
         image_max_pixels = std::min(
-            std::max(
-                thread_max_tokens_override * hparams.patch_size * hparams.patch_size,
-                hparams.patch_size * hparams.patch_size),
+            std::max(thread_max_tokens_override * token_area, token_area),
             hparams.image_max_pixels);
     }
     int adaptive_min_pixels = 0;
