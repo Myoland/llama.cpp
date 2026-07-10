@@ -1824,6 +1824,11 @@ void mtmd_batch_free(mtmd_batch * batch) {
     }
 }
 
+static bool mtmd_cross_slot_vision_batch_enabled() {
+    static const bool enabled = getenv("LLAMA_EXPERIMENT_CROSS_SLOT_VISION_BATCH") != nullptr;
+    return enabled;
+}
+
 int32_t mtmd_batch_add_chunk(mtmd_batch * batch, const mtmd_input_chunk * chunk) {
     if (chunk->type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
         LOG_ERR("%s: text chunk is not supported in batch\n", __func__);
@@ -1842,8 +1847,12 @@ int32_t mtmd_batch_add_chunk(mtmd_batch * batch, const mtmd_input_chunk * chunk)
         return 0;
     }
 
-    if (!clip_support_batch(ctx)) {
-        // if no batching support, batch can only have one single chunk
+    if (!clip_support_batch(ctx) &&
+        !(mtmd_cross_slot_vision_batch_enabled() && chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE)) {
+        // if no batching support, batch can only have one single chunk.
+        // experimental exception: image chunks encode via
+        // mtmd_encode_image_chunks, which batches same-shape groups through
+        // clip_image_batch_encode bounded by the model's batch cap
         return 2; // "batch too large" error code
     }
 
@@ -1854,6 +1863,16 @@ int32_t mtmd_batch_add_chunk(mtmd_batch * batch, const mtmd_input_chunk * chunk)
 
     auto & first_chunk = batch->entries[0];
     if (first_chunk->can_batch_with(*chunk)) {
+        batch->entries.push_back(chunk);
+        return 0;
+    }
+
+    if (mtmd_cross_slot_vision_batch_enabled() &&
+        first_chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE &&
+        chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+        // mixed-shape image chunks: mtmd_batch_encode routes these through
+        // mtmd_encode_image_chunks, which groups same-shape entries and
+        // encodes the rest sequentially
         batch->entries.push_back(chunk);
         return 0;
     }
@@ -1871,6 +1890,19 @@ static int32_t mtmd_batch_encode_impl(mtmd_batch * batch) {
             LOG_ERR("%s: chunk is placeholder\n", __func__);
             return 1;
         }
+    }
+
+    if (mtmd_cross_slot_vision_batch_enabled() &&
+        std::all_of(batch->entries.begin(), batch->entries.end(),
+                    [](const mtmd_input_chunk * c) { return c->type == MTMD_INPUT_CHUNK_TYPE_IMAGE; })) {
+        // shape-aware path: groups same-shape entries into ViT batches and
+        // falls back to sequential encode for the rest
+        int32_t res = mtmd_encode_image_chunks(
+            batch->ctx, batch->entries.data(), batch->entries.size(), nullptr, nullptr);
+        if (res == 0) {
+            batch->output_embd = std::move(batch->ctx->out_embd);
+        }
+        return res;
     }
 
     // represent the whole batch as one single chunk

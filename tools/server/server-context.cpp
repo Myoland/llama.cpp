@@ -3004,6 +3004,13 @@ private:
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
+            // experimental: gather image chunks from multiple slots and encode
+            // them in one mtmd batch so same-shape crops go through the ViT
+            // together instead of encoding serially per slot
+            static const bool cross_slot_vision_batch =
+                getenv("LLAMA_EXPERIMENT_CROSS_SLOT_VISION_BATCH") != nullptr;
+            std::vector<std::pair<server_slot *, size_t>> mtmd_gather;
+
             iterate(slots, [&](server_slot & slot) {
                 if (!add_ok || batch.size() >= n_batch) {
                     return; // batch is full, skip remaining slots
@@ -3384,6 +3391,21 @@ private:
                             break;
                         }
 
+                        if (cross_slot_vision_batch && mctx != nullptr) {
+                            bool have_embd = false;
+                            if (slot.mbatch) {
+                                const auto & chunk = input_tokens.find_chunk(cur_token_idx);
+                                have_embd = mtmd_batch_get_output_embd(slot.mbatch.get(), chunk.get()) != nullptr;
+                            }
+                            if (!have_embd) {
+                                // defer the encode: it happens together with the
+                                // other slots' images right after this pass; the
+                                // slot resumes its text tokens next pass
+                                mtmd_gather.push_back({ &slot, (size_t) cur_token_idx });
+                                return;
+                            }
+                        }
+
                         // process the image
                         size_t n_tokens_out = 0;
                         int32_t res = slot.process_mtmd_chunk(cur_token_idx, n_tokens_out);
@@ -3520,6 +3542,84 @@ private:
                     slot_batched = &slot;
                 }
             });
+
+            if (!mtmd_gather.empty()) {
+                SRV_WRN("cross-slot vision gather: %zu image chunk(s) this pass\n", mtmd_gather.size());
+                // encode all gathered image chunks in one mtmd batch. The batch
+                // does not own the chunks and must not outlive this pass, so the
+                // embeddings are decoded into each slot right here.
+                mtmd::batch_ptr gbatch(mtmd_batch_init(mctx));
+
+                struct gather_item {
+                    server_slot * slot;
+                    size_t        idx;
+                    const mtmd_input_chunk * chunk;
+                    size_t        n_tokens;
+                    bool          in_batch;
+                };
+                std::vector<gather_item> items;
+                items.reserve(mtmd_gather.size());
+                for (const auto & entry : mtmd_gather) {
+                    server_slot * gslot = entry.first;
+                    const size_t  gidx  = entry.second;
+                    const auto & chunk = gslot->task->tokens.find_chunk(gidx);
+                    const bool added = mtmd_batch_add_chunk(gbatch.get(), chunk.get()) == 0;
+                    items.push_back({ gslot, gidx, chunk.get(), mtmd_input_chunk_get_n_tokens(chunk.get()), added });
+                }
+
+                bool encode_ok = true;
+                if (std::any_of(items.begin(), items.end(), [](const gather_item & it) { return it.in_batch; })) {
+                    encode_ok = mtmd_batch_encode(gbatch.get()) == 0;
+                    if (!encode_ok) {
+                        SRV_WRN("cross-slot vision batch encode failed, falling back to per-slot encode (n = %zu)\n", items.size());
+                    }
+                }
+
+                for (auto & it : items) {
+                    server_slot & gslot = *it.slot;
+                    int32_t res = 0;
+                    size_t n_tokens_out = 0;
+
+                    float * embd = (encode_ok && it.in_batch) ? mtmd_batch_get_output_embd(gbatch.get(), it.chunk) : nullptr;
+                    if (embd) {
+                        void * cb_data = gslot.spec;
+                        static auto cb = [](llama_batch batch, void * user_data) {
+                            common_speculative * spec = static_cast<common_speculative *>(user_data);
+                            if (!common_speculative_process(spec, batch)) {
+                                return 1;
+                            }
+                            return 0;
+                        };
+                        llama_pos new_n_past; // unused for now
+                        res = mtmd_helper_decode_image_chunk(
+                            mctx,
+                            ctx_tgt,
+                            it.chunk,
+                            embd,
+                            gslot.prompt.tokens.pos_next(),
+                            gslot.id,
+                            llama_n_batch(ctx_tgt),
+                            &new_n_past,
+                            cb,
+                            cb_data);
+                        n_tokens_out = it.n_tokens;
+                    } else {
+                        // did not fit the shared batch (or encode failed): fall
+                        // back to the existing per-slot encode path
+                        res = gslot.process_mtmd_chunk(it.idx, n_tokens_out);
+                    }
+
+                    if (res != 0) {
+                        SLT_ERR(gslot, "failed to process gathered image chunk, res = %d\n", res);
+                        send_error(gslot, "failed to process image", ERROR_TYPE_SERVER);
+                        gslot.release();
+                        continue;
+                    }
+
+                    gslot.n_prompt_tokens_processed += n_tokens_out;
+                    gslot.prompt.tokens.push_back(it.chunk); // copy into the prompt cache
+                }
+            }
         }
     }
 
