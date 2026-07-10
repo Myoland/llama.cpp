@@ -8248,6 +8248,14 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
         return aligned ? mmp->a_s : mmp->s;
     }
 
+    // experimentation override: GGML_VK_FORCE_MM_TILE = s|m|l
+    static const char * force_tile = getenv("GGML_VK_FORCE_MM_TILE");
+    if (force_tile && m > 64 && n > 64) {
+        if (force_tile[0] == 's' && mm_s) return aligned ? mmp->a_s : mmp->s;
+        if (force_tile[0] == 'm' && mm_m) return aligned ? mmp->a_m : mmp->m;
+        if (force_tile[0] == 'l' && mm_l) return aligned ? mmp->a_l : mmp->l;
+    }
+
     if ((mm_s && (m <= 32 || n <= 32)) || (!mm_m && !mm_l)) {
         return aligned ? mmp->a_s : mmp->s;
     }
@@ -8333,6 +8341,14 @@ static vk_pipeline ggml_vk_guess_matmul_id_pipeline(ggml_backend_vk_context * ct
             return aligned ? mmp->a_m : mmp->m;
         }
         return aligned ? mmp->a_s : mmp->s;
+    }
+
+    // experimentation override: GGML_VK_FORCE_MM_TILE = s|m|l
+    static const char * force_tile = getenv("GGML_VK_FORCE_MM_TILE");
+    if (force_tile && m > 64 && n > 64) {
+        if (force_tile[0] == 's' && mm_s) return aligned ? mmp->a_s : mmp->s;
+        if (force_tile[0] == 'm' && mm_m) return aligned ? mmp->a_m : mmp->m;
+        if (force_tile[0] == 'l' && mm_l) return aligned ? mmp->a_l : mmp->l;
     }
 
     if ((mm_s && (m <= 32 || n <= 32)) || (!mm_m && !mm_l)) {
