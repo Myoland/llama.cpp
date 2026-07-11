@@ -2715,7 +2715,11 @@ private:
     };
 #endif
 
+    // one-encode-per-pass experiment state (MTMD_ENCODE_PER_ITER)
+    bool mtmd_encoded_this_iter = false;
+
     void update_slots() {
+        mtmd_encoded_this_iter = false;
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -3388,6 +3392,11 @@ private:
 
                     bool has_mtmd = false;
 
+                    // experiment: cap mtmd encodes to one per update_slots pass so
+                    // already-ingested slots' text prompts and generation keep flowing
+                    // between encodes instead of stalling behind an encode train
+                    static const bool encode_per_iter = getenv("MTMD_ENCODE_PER_ITER") != nullptr;
+
                     // check if we should process the image
                     while (true) {
                         auto cur_token_idx = slot.prompt.n_tokens();
@@ -3395,6 +3404,13 @@ private:
                             cur_token_idx >= slot.task->n_tokens() ||
                             input_tokens[cur_token_idx] != LLAMA_TOKEN_NULL // encountered a text token
                         ) {
+                            break;
+                        }
+
+                        if (encode_per_iter && mtmd_encoded_this_iter) {
+                            // an encode already ran in this pass; defer this slot's
+                            // image (and the rest of its prompt) to the next pass so
+                            // the pending batch gets decoded first
                             break;
                         }
 
@@ -3415,7 +3431,13 @@ private:
 
                         // process the image
                         size_t n_tokens_out = 0;
+                        static const bool sched_trace = getenv("MTMD_SCHED_TRACE") != nullptr;
+                        int64_t t_enc0 = sched_trace ? ggml_time_us() : 0;
                         int32_t res = slot.process_mtmd_chunk(cur_token_idx, n_tokens_out);
+                        if (sched_trace) {
+                            fprintf(stderr, "[sched] %lld ENCODE slot=%d dur_ms=%.1f\n", (long long) ggml_time_us(), slot.id, (ggml_time_us() - t_enc0) / 1000.0);
+                        }
+                        mtmd_encoded_this_iter = true;
                         if (res != 0) {
                             SLT_ERR(slot, "failed to process image, res = %d\n", res);
                             send_error(slot, "failed to process image", ERROR_TYPE_SERVER);
@@ -3666,6 +3688,10 @@ private:
             n_empty_consecutive = 0;
         }
 
+        static const bool sched_trace = getenv("MTMD_SCHED_TRACE") != nullptr;
+        if (sched_trace) {
+            fprintf(stderr, "[sched] %lld DECODE n=%d\n", (long long) ggml_time_us(), batch_view.n_tokens);
+        }
         const int ret = llama_decode(ctx_tgt, batch_view);
 
         metrics.on_decoded(slots);
