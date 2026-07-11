@@ -8255,12 +8255,18 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
         return aligned ? mmp->a_s : mmp->s;
     }
 
-    // experimentation override: GGML_VK_FORCE_MM_TILE = s|m|l
+    // On RDNA3 the medium tile beats the large one on every measured m,n>64
+    // shape (PaddleOCR-VL ViT: +14..74%), so default to it there.
+    // GGML_VK_FORCE_MM_TILE=s|m|l overrides in either direction.
     static const char * force_tile = getenv("GGML_VK_FORCE_MM_TILE");
-    if (force_tile && m > 64 && n > 64) {
-        if (force_tile[0] == 's' && mm_s) return aligned ? mmp->a_s : mmp->s;
-        if (force_tile[0] == 'm' && mm_m) return aligned ? mmp->a_m : mmp->m;
-        if (force_tile[0] == 'l' && mm_l) return aligned ? mmp->a_l : mmp->l;
+    char mm_tile_pref = force_tile ? force_tile[0] : 0;
+    if (mm_tile_pref == 0 && ctx->device->architecture == vk_device_architecture::AMD_RDNA3) {
+        mm_tile_pref = 'm';
+    }
+    if (mm_tile_pref && m > 64 && n > 64) {
+        if (mm_tile_pref == 's' && mm_s) return aligned ? mmp->a_s : mmp->s;
+        if (mm_tile_pref == 'm' && mm_m) return aligned ? mmp->a_m : mmp->m;
+        if (mm_tile_pref == 'l' && mm_l) return aligned ? mmp->a_l : mmp->l;
     }
 
     if ((mm_s && (m <= 32 || n <= 32)) || (!mm_m && !mm_l)) {
@@ -8362,12 +8368,18 @@ static vk_pipeline ggml_vk_guess_matmul_id_pipeline(ggml_backend_vk_context * ct
         return aligned ? mmp->a_s : mmp->s;
     }
 
-    // experimentation override: GGML_VK_FORCE_MM_TILE = s|m|l
+    // On RDNA3 the medium tile beats the large one on every measured m,n>64
+    // shape (PaddleOCR-VL ViT: +14..74%), so default to it there.
+    // GGML_VK_FORCE_MM_TILE=s|m|l overrides in either direction.
     static const char * force_tile = getenv("GGML_VK_FORCE_MM_TILE");
-    if (force_tile && m > 64 && n > 64) {
-        if (force_tile[0] == 's' && mm_s) return aligned ? mmp->a_s : mmp->s;
-        if (force_tile[0] == 'm' && mm_m) return aligned ? mmp->a_m : mmp->m;
-        if (force_tile[0] == 'l' && mm_l) return aligned ? mmp->a_l : mmp->l;
+    char mm_tile_pref = force_tile ? force_tile[0] : 0;
+    if (mm_tile_pref == 0 && ctx->device->architecture == vk_device_architecture::AMD_RDNA3) {
+        mm_tile_pref = 'm';
+    }
+    if (mm_tile_pref && m > 64 && n > 64) {
+        if (mm_tile_pref == 's' && mm_s) return aligned ? mmp->a_s : mmp->s;
+        if (mm_tile_pref == 'm' && mm_m) return aligned ? mmp->a_m : mmp->m;
+        if (mm_tile_pref == 'l' && mm_l) return aligned ? mmp->a_l : mmp->l;
     }
 
     if ((mm_s && (m <= 32 || n <= 32)) || (!mm_m && !mm_l)) {
