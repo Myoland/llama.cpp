@@ -5,6 +5,7 @@
 // try as much as possible to not include this header in the rest of the codebase
 
 #include "llama.h"
+#include "ggml-backend.h"
 
 #include <cstdint>
 #include <map>
@@ -124,3 +125,5 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
 // returns the number of extracted layers from target model
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
+
+LLAMA_API ggml_backend_sched_t llama_get_sched(const struct llama_context * ctx);

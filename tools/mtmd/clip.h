@@ -56,6 +56,9 @@ struct clip_context_params {
     bool no_alloc;
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
+    // optional: share an existing scheduler instead of creating a new one
+    // caller must ensure the scheduler outlives the clip context
+    ggml_backend_sched_t sched;
 };
 
 struct clip_init_result {

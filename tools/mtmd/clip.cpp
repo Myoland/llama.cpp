@@ -160,9 +160,14 @@ struct clip_ctx {
 
 
     int max_nodes = 8192;
-    ggml_backend_sched_ptr sched;
+    ggml_backend_sched_ptr sched;     // owned scheduler (when no external sched is provided)
+    ggml_backend_sched_t ext_sched = nullptr; // borrowed scheduler (not freed by this context)
     clip_flash_attn_type flash_attn_type = CLIP_FLASH_ATTN_TYPE_AUTO;
     bool is_allocated = false;
+
+    ggml_backend_sched_t get_sched() const {
+        return ext_sched ? ext_sched : sched.get();
+    }
 
     bool debug_output_embeddings = false;
 
@@ -213,12 +218,16 @@ struct clip_ctx {
         backend_ptrs.push_back(backend_cpu);
         backend_buft.push_back(ggml_backend_get_default_buffer_type(backend_cpu));
 
-        sched.reset(
-            ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), 8192, false, true)
-        );
+        if (ctx_params.sched) {
+            ext_sched = ctx_params.sched;
+        } else {
+            sched.reset(
+                ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), 8192, false, true)
+            );
+        }
 
         if (ctx_params.cb_eval != nullptr) {
-            ggml_backend_sched_set_eval_callback(sched.get(), ctx_params.cb_eval, ctx_params.cb_eval_user_data);
+            ggml_backend_sched_set_eval_callback(get_sched(), ctx_params.cb_eval, ctx_params.cb_eval_user_data);
         }
 
         debug_output_embeddings = std::getenv("MTMD_DEBUG_EMBEDDINGS") != nullptr;
@@ -3057,22 +3066,31 @@ struct clip_model_loader {
     // only initialize backend buffers, but do not allocate them yet
     static support_info_graph reserve_compute_meta(clip_ctx & ctx_clip, const clip_image_f32_batch & batch) {
         ggml_cgraph * gf = clip_get_graph_builder(&ctx_clip, batch)->build();
-        ggml_backend_sched_reserve(ctx_clip.sched.get(), gf);
+        if (ctx_clip.sched) {
+            ggml_backend_sched_reserve(ctx_clip.sched.get(), gf);
+        }
+        // note: with an external (shared) sched, reserving here would clobber the
+        // llama context's pre-allocated tensors; the graph is allocated on demand
+        // in clip_image_batch_encode instead
 
         ctx_clip.mem_compute.clear();
-        for (size_t i = 0; i < ctx_clip.backend_ptrs.size(); ++i) {
-            ggml_backend_t backend = ctx_clip.backend_ptrs[i];
-            ggml_backend_buffer_type_t buft = ctx_clip.backend_buft[i];
-            size_t size = ggml_backend_sched_get_buffer_size(ctx_clip.sched.get(), backend);
-            if (size > 1) {
-                LOG_INF("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
-                        ggml_backend_buft_name(buft),
-                        size / 1024.0 / 1024.0);
+        {
+            ggml_backend_sched_t sched = ctx_clip.get_sched();
+            const int n_backends = ggml_backend_sched_get_n_backends(sched);
+            for (int i = 0; i < n_backends; ++i) {
+                ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
+                ggml_backend_buffer_type_t buft = ggml_backend_sched_get_buffer_type(sched, backend);
+                size_t size = ggml_backend_sched_get_buffer_size(sched, backend);
+                if (size > 1) {
+                    LOG_INF("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
+                            ggml_backend_buft_name(buft),
+                            size / 1024.0 / 1024.0);
+                }
+                ctx_clip.mem_compute[ggml_backend_get_device(backend)] += size;
             }
-            ctx_clip.mem_compute[ggml_backend_get_device(backend)] += size;
         }
 
-        const int n_splits = ggml_backend_sched_get_n_splits(ctx_clip.sched.get());
+        const int n_splits = ggml_backend_sched_get_n_splits(ctx_clip.get_sched());
         const int n_nodes  = ggml_graph_n_nodes(gf);
 
         LOG_INF("%s: graph splits = %d, nodes = %d\n", __func__,  n_splits, n_nodes);
@@ -3656,7 +3674,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
     }
 
     // build the inference graph
-    ggml_backend_sched_reset(ctx->sched.get());
+    ggml_backend_sched_reset(ctx->get_sched());
     if (stage_timing) {
         t_after_reset_us = ggml_time_us();
     }
@@ -3664,7 +3682,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
     if (stage_timing) {
         t_after_build_us = ggml_time_us();
     }
-    ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
+    ggml_backend_sched_alloc_graph(ctx->get_sched(), gf);
     if (stage_timing) {
         t_after_alloc_us = ggml_time_us();
     }
@@ -4611,7 +4629,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
         t_after_set_threads_us = ggml_time_us();
     }
 
-    auto status = ggml_backend_sched_graph_compute(ctx->sched.get(), gf);
+    auto status = ggml_backend_sched_graph_compute(ctx->get_sched(), gf);
     if (stage_timing) {
         t_after_compute_us = ggml_time_us();
     }

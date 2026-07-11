@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "../../src/llama-ext.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -1206,6 +1207,12 @@ private:
                 mtmd_helper_log_set(common_log_default_callback, nullptr);
             }
 
+            // share the llama context scheduler with mtmd (upstream PR #24361):
+            // encode and decode never run concurrently, so one compute buffer
+            // serves both. MTMD_NO_SHARED_SCHED=1 restores separate scheds.
+            if (getenv("MTMD_NO_SHARED_SCHED") == nullptr) {
+                mparams.sched = llama_get_sched(ctx_tgt);
+            }
             mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
             if (mctx == nullptr) {
                 SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());

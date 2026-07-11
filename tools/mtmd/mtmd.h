@@ -112,6 +112,11 @@ struct mtmd_context_params {
     // If it returns false, model loading is immediately aborted.
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
+
+    // optional: share an existing scheduler (e.g. from llama_context via llama_get_sched())
+    // instead of creating a separate one, saving compute buffer memory
+    // caller must ensure the scheduler outlives the mtmd context
+    ggml_backend_sched_t sched;
 };
 
 MTMD_API const char * mtmd_default_marker(void);
