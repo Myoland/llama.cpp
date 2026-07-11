@@ -26,6 +26,13 @@
 const uint32_t MatBr = 16;
 const uint32_t MatBc = 16;
 
+// Intel Arc exposes only an 8x16x16 cooperative-matrix tile. When FA_MATBC==8
+// we keep the 16-wide tiling/index math but split each 16x16x16 coopmatmuladd
+// into two 8x16x16 ops over the M (row) dimension.
+layout (constant_id = 16) const uint32_t FA_MATBC = 16;
+const bool M8 = (FA_MATBC == 8u);
+const uint32_t MatBcH = 8;
+
 const uint32_t rows_per_thread = Br / row_split;
 const uint32_t cols_per_iter = gl_WorkGroupSize.x / row_split;
 const uint32_t cols_per_thread = Bc / cols_per_iter;
@@ -255,6 +262,11 @@ void main() {
         coopmat<ACC_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator> SfMat = coopmat<ACC_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(0);
         coopmat<FLOAT_TYPE, gl_ScopeSubgroup, MatBc, 16, gl_MatrixUseA> KMat;
         coopmat<FLOAT_TYPE, gl_ScopeSubgroup, 16, MatBr, gl_MatrixUseB> QMat;
+        // M=8 split accumulators/operands (Intel 8x16x16 tile)
+        coopmat<ACC_TYPE, gl_ScopeSubgroup, MatBcH, MatBr, gl_MatrixUseAccumulator> SfMat0 = coopmat<ACC_TYPE, gl_ScopeSubgroup, MatBcH, MatBr, gl_MatrixUseAccumulator>(0);
+        coopmat<ACC_TYPE, gl_ScopeSubgroup, MatBcH, MatBr, gl_MatrixUseAccumulator> SfMat1 = coopmat<ACC_TYPE, gl_ScopeSubgroup, MatBcH, MatBr, gl_MatrixUseAccumulator>(0);
+        coopmat<FLOAT_TYPE, gl_ScopeSubgroup, MatBcH, 16, gl_MatrixUseA> KMat0;
+        coopmat<FLOAT_TYPE, gl_ScopeSubgroup, MatBcH, 16, gl_MatrixUseA> KMat1;
 
         [[unroll]] for (uint32_t d = 0; d < HSK_pad / 16; ++d) {
             // If SHMEM_STAGING is set, a Bc * HSK_pad size tile of K is loaded to shmem
@@ -294,23 +306,28 @@ void main() {
 
             if (stage_k) {
                 uint coord = (gl_SubgroupID * MatBc) * kvsh_stride;
-                coopMatLoad(KMat, kvsh, coord, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                if (M8) { coopMatLoad(KMat0, kvsh, coord, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor); coopMatLoad(KMat1, kvsh, coord + 8u*kvsh_stride, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor); }
+                else { coopMatLoad(KMat, kvsh, coord, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor); }
             } else {
                 const uint coord = k_offset / 4 + (j * Bc + gl_SubgroupID * MatBc) * k_stride / 4 + d * 16 / 4;
-                coopMatLoad(KMat, data_kv4, coord, k_stride / 4, gl_CooperativeMatrixLayoutRowMajor);
+                if (M8) { coopMatLoad(KMat0, data_kv4, coord, k_stride / 4, gl_CooperativeMatrixLayoutRowMajor); coopMatLoad(KMat1, data_kv4, coord + 8u*(k_stride/4), k_stride / 4, gl_CooperativeMatrixLayoutRowMajor); }
+                else { coopMatLoad(KMat, data_kv4, coord, k_stride / 4, gl_CooperativeMatrixLayoutRowMajor); }
             }
             } else {
                 uint coord = (gl_SubgroupID * MatBc) * kvsh_stride + d * 16 / 4;
-                coopMatLoad(KMat, kvsh, coord, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                if (M8) { coopMatLoad(KMat0, kvsh, coord, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor); coopMatLoad(KMat1, kvsh, coord + 8u*kvsh_stride, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor); }
+                else { coopMatLoad(KMat, kvsh, coord, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor); }
             }
 
             coopMatLoad(QMat, Qf, d * 16 / 4, qstride, gl_CooperativeMatrixLayoutColumnMajor);
 
-            SfMat = coopMatMulAdd(KMat, QMat, SfMat);
+            if (M8) { SfMat0 = coopMatMulAdd(KMat0, QMat, SfMat0); SfMat1 = coopMatMulAdd(KMat1, QMat, SfMat1); }
+            else { SfMat = coopMatMulAdd(KMat, QMat, SfMat); }
         }
 
         uint coord = gl_SubgroupID * MatBc * sfshstride;
-        coopMatStore(SfMat, sfsh, coord, sfshstride, gl_CooperativeMatrixLayoutRowMajor);
+        if (M8) { coopMatStore(SfMat0, sfsh, coord, sfshstride, gl_CooperativeMatrixLayoutRowMajor); coopMatStore(SfMat1, sfsh, coord + 8u*sfshstride, sfshstride, gl_CooperativeMatrixLayoutRowMajor); }
+        else { coopMatStore(SfMat, sfsh, coord, sfshstride, gl_CooperativeMatrixLayoutRowMajor); }
         barrier();
 
         if (LOGIT_SOFTCAP) {
@@ -426,6 +443,8 @@ void main() {
             const uint hsv_offset = (hsv_tile * row_split + gl_SubgroupID) * 16;
 
             coopmat<O_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator> PVMat = coopmat<O_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(0);
+            coopmat<O_TYPE, gl_ScopeSubgroup, MatBcH, MatBr, gl_MatrixUseAccumulator> PVMat0 = coopmat<O_TYPE, gl_ScopeSubgroup, MatBcH, MatBr, gl_MatrixUseAccumulator>(0);
+            coopmat<O_TYPE, gl_ScopeSubgroup, MatBcH, MatBr, gl_MatrixUseAccumulator> PVMat1 = coopmat<O_TYPE, gl_ScopeSubgroup, MatBcH, MatBr, gl_MatrixUseAccumulator>(0);
 
             // Preload V tiles for [Bc, 16 * num subgroups]
             const uint v_rows = Bc;
@@ -474,7 +493,8 @@ void main() {
 
             if (hsv_offset < HSV_pad) {
                 [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
-                    coopMatLoad(KMat, Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
+                    if (M8) { coopMatLoad(KMat0, Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor); coopMatLoad(KMat1, Psh, bc_chunk * MatBc * psh_stride + 2u, psh_stride, gl_CooperativeMatrixLayoutColumnMajor); }
+                    else { coopMatLoad(KMat, Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor); }
 
                     if (SHMEM_STAGING == 0) {
                     if (!USE_DECODE_V && !KV_bounds_check) {
@@ -491,11 +511,13 @@ void main() {
                         coopMatLoad(QMat, kvsh, v_tile_offset, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
                     }
 
-                    PVMat = coopMatMulAdd(KMat, QMat, PVMat);
+                    if (M8) { PVMat0 = coopMatMulAdd(KMat0, QMat, PVMat0); PVMat1 = coopMatMulAdd(KMat1, QMat, PVMat1); }
+                    else { PVMat = coopMatMulAdd(KMat, QMat, PVMat); }
                 }
 
                 // Store PVMat to pvsh and load into Of
-                coopMatStore(PVMat, pvsh, o_offset, osh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                if (M8) { coopMatStore(PVMat0, pvsh, o_offset, osh_stride, gl_CooperativeMatrixLayoutRowMajor); coopMatStore(PVMat1, pvsh, o_offset + 8u*osh_stride, osh_stride, gl_CooperativeMatrixLayoutRowMajor); }
+                else { coopMatStore(PVMat, pvsh, o_offset, osh_stride, gl_CooperativeMatrixLayoutRowMajor); }
             }
 
             barrier();

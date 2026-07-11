@@ -481,10 +481,11 @@ struct vk_fa_pipeline_state {
     uint32_t limit_occupancy_shmem;
     ggml_type k_type;
     ggml_type v_type;
+    uint32_t mat_bc;
 
     bool operator<(const vk_fa_pipeline_state &b) const {
-        return std::tie(HSK, HSV, Br, Bc, D_split, row_split, shmem_staging, path, workgroup_size, subgroup_size, aligned, f32acc, flags, limit_occupancy_shmem, k_type, v_type) <
-               std::tie(b.HSK, b.HSV, b.Br, b.Bc, b.D_split, b.row_split, b.shmem_staging, b.path, b.workgroup_size, b.subgroup_size, b.aligned, b.f32acc, b.flags, b.limit_occupancy_shmem, b.k_type, b.v_type);
+        return std::tie(HSK, HSV, Br, Bc, D_split, row_split, shmem_staging, path, workgroup_size, subgroup_size, aligned, f32acc, flags, limit_occupancy_shmem, k_type, v_type, mat_bc) <
+               std::tie(b.HSK, b.HSV, b.Br, b.Bc, b.D_split, b.row_split, b.shmem_staging, b.path, b.workgroup_size, b.subgroup_size, b.aligned, b.f32acc, b.flags, b.limit_occupancy_shmem, b.k_type, b.v_type, b.mat_bc);
     }
 };
 
@@ -730,6 +731,8 @@ struct vk_device_struct {
     bool coopmat_bf16_support {};
     bool coopmat_support_16x16x16_f16acc {};
     bool coopmat_support_16x16x16_f32acc {};
+    bool coopmat_support_8x16x16_f16acc {};
+    bool coopmat_support_8x16x16_f32acc {};
     bool coopmat1_fa_support {};
     uint32_t coopmat_m;
     uint32_t coopmat_n;
@@ -3376,6 +3379,7 @@ struct vk_fa_tuning_params {
     bool shmem_staging;
     bool disable_subgroups;
     uint32_t limit_occupancy_shmem;
+    uint32_t mat_bc;
 
     void print() const {
         std::cerr << "path=" << path << " workgroup_size=" << workgroup_size << " subgroup_size=" << subgroup_size <<
@@ -3479,6 +3483,12 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     const uint32_t coopmat_block_cols = 16;
 
     const uint32_t num_subgroups = 4;
+    // Intel Arc exposes only an 8x16x16 cooperative-matrix tile (M=8). Keep the
+    // 16-wide tiling/index math, but tell the shader to issue each 16x16x16
+    // coopmatmuladd as two 8x16x16 ops (M split 16 -> 8+8).
+    const bool m8_split = !device->coopmat_support_16x16x16_f16acc &&
+                          !device->coopmat_support_16x16x16_f32acc &&
+                          (device->coopmat_support_8x16x16_f16acc || device->coopmat_support_8x16x16_f32acc);
 
     result.block_rows = coopmat_block_rows;
     result.block_cols = coopmat_block_cols * num_subgroups;
@@ -3490,6 +3500,8 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     result.d_split = std::min(std::min(result.subgroup_size, 8u), D_lsb / 4);
 
     result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
+    result.mat_bc = m8_split ? 8u : 16u;
+
 
     return result;
 }
@@ -3539,8 +3551,8 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
     }
 
     if (path == FA_COOPMAT1) {
-        bool shape_ok = (f32acc && device->coopmat_support_16x16x16_f32acc) ||
-                        (!f32acc && device->coopmat_support_16x16x16_f16acc);
+        bool shape_ok = (f32acc && (device->coopmat_support_16x16x16_f32acc || device->coopmat_support_8x16x16_f32acc)) ||
+                        (!f32acc && (device->coopmat_support_16x16x16_f16acc || device->coopmat_support_8x16x16_f16acc));
         const vk_fa_tuning_params params = get_fa_tuning_params_coopmat1(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
         bool shmem_ok = ggml_vk_flash_attn_coopmat_shmem_support(device, params, hsk, hsv, f32acc, k_type);
 
@@ -3583,7 +3595,7 @@ static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
-    return vk_fa_pipeline_state{hsk, hsv, params.block_rows, params.block_cols, params.d_split, params.row_split, params.shmem_staging, params.path, params.workgroup_size, subgroup_size, aligned, f32acc, flags, params.limit_occupancy_shmem, k_type, v_type};
+    return vk_fa_pipeline_state{hsk, hsv, params.block_rows, params.block_cols, params.d_split, params.row_split, params.shmem_staging, params.path, params.workgroup_size, subgroup_size, aligned, f32acc, flags, params.limit_occupancy_shmem, k_type, v_type, params.mat_bc};
 }
 
 static std::vector<uint32_t> get_fa_spec_constants(const vk_fa_pipeline_state& state) {
@@ -3608,6 +3620,7 @@ static std::vector<uint32_t> get_fa_spec_constants(const vk_fa_pipeline_state& s
         /*13 FaTypeV         */ static_cast<uint32_t>(state.v_type),
         /*14 FaBlockBytesK   */ fa_block_bytes(state.k_type),
         /*15 FaBlockBytesV   */ fa_block_bytes(state.v_type),
+        /*16 MatBc           */ state.mat_bc ? state.mat_bc : 16u,
     };
 }
 
@@ -6395,6 +6408,9 @@ static vk_device ggml_vk_get_device(size_t idx) {
                         if (prop.MSize == 16 && prop.NSize == 16 && prop.KSize == 16) {
                             device->coopmat_support_16x16x16_f32acc = true;
                         }
+                        if (prop.MSize == 8 && prop.NSize == 16 && prop.KSize == 16) {
+                            device->coopmat_support_8x16x16_f32acc = true;
+                        }
                     } else if ((vk::ComponentTypeKHR)prop.CType == vk::ComponentTypeKHR::eFloat16 &&
                                (vk::ComponentTypeKHR)prop.ResultType == vk::ComponentTypeKHR::eFloat16) {
                         // coopmat sizes not set yet
@@ -6409,6 +6425,9 @@ static vk_device ggml_vk_get_device(size_t idx) {
                         }
                         if (prop.MSize == 16 && prop.NSize == 16 && prop.KSize == 16) {
                             device->coopmat_support_16x16x16_f16acc = true;
+                        }
+                        if (prop.MSize == 8 && prop.NSize == 16 && prop.KSize == 16) {
+                            device->coopmat_support_8x16x16_f16acc = true;
                         }
                     }
                 } else if ((vk::ComponentTypeKHR)prop.AType      == vk::ComponentTypeKHR::eSint8 &&
