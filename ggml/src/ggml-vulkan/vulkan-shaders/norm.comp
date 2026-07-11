@@ -1,7 +1,31 @@
 #version 450
 
 #include "types.glsl"
+#ifdef NORM_MUL_ADD
+// fused layernorm + weight mul + bias add: bindings x, w, b, out
+#extension GL_EXT_shader_16bit_storage : require
+
+layout (push_constant) uniform parameter
+{
+    uint ne;
+    uint ne00; uint ne01; uint ne02; uint ne03; uint nb00; uint nb01; uint nb02; uint nb03;
+    uint ne10; uint ne11; uint ne12; uint ne13; uint nb10; uint nb11; uint nb12; uint nb13;
+    uint misalign_offsets;
+    float param1; float param2; float param3; float param4;
+    uint ne0_012mp; uint ne0_01mp;  uint ne0_0mp;  uint ne0_Ls;
+    uint ne1_012mp; uint ne1_01mp;  uint ne1_0mp;  uint ne1_Ls;
+} p;
+
+layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+layout (binding = 1) readonly buffer W {A_TYPE data_w[];};
+layout (binding = 2) readonly buffer BIAS {A_TYPE data_bias[];};
+layout (binding = 3) writeonly buffer D {D_TYPE data_d[];};
+
+uint get_aoffset() { return p.misalign_offsets >> 16; }
+uint get_doffset() { return p.misalign_offsets & 0xFFFF; }
+#else
 #include "generic_unary_head.glsl"
+#endif
 
 #extension GL_EXT_control_flow_attributes : enable
 #define BLOCK_SIZE 512
@@ -14,8 +38,14 @@ void main() {
     const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
     const uint tid = gl_LocalInvocationID.x;
 
+#ifdef NORM_MUL_ADD
+    // fused path requires contiguous src/dst (gated on the host side)
+    const uint a_base = get_aoffset() + row * p.ne00;
+    const uint d_base = get_doffset() + row * p.ne10;
+#else
     const uint a_base = get_aoffset() + src0_idx(row * p.ne00);
     const uint d_base = get_doffset() + dst_idx(row * p.ne10);
+#endif
 
     sum[tid] = vec2(0.0f, 0.0f);
 
@@ -39,6 +69,14 @@ void main() {
     const float inv_std = inversesqrt(var + p.param1);
 
     [[unroll]] for (uint i0 = tid; i0 < p.ne00; i0 += BLOCK_SIZE) {
+#ifdef NORM_MUL_ADD
+        const float v = (float(data_a[a_base + i0]) - mean) * inv_std;
+        // separate rounding steps to match the unfused NORM->MUL->ADD sequence bit-exactly
+        precise float t = v * float(data_w[i0]);
+        precise float r = t + float(data_bias[i0]);
+        data_d[d_base + i0] = D_TYPE(r);
+#else
         data_d[d_base + i0*p.nb10] = D_TYPE((float(data_a[a_base + i0*p.nb00]) - mean) * inv_std);
+#endif
     }
 }

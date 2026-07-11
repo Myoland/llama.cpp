@@ -70,6 +70,14 @@ layout (binding = 3) readonly buffer IDS {int data_ids[];};
 layout (binding = 4) readonly buffer Counts {int data_expert_count[];};
 #else
 layout (binding = 3) readonly buffer BIAS {D_TYPE data_bias[];};
+layout (binding = 4) readonly buffer ADDM {D_TYPE data_addm[];};
+
+float mm_op_gelu(float x) {
+    const float GELU_COEF_A    = 0.044715f;
+    const float SQRT_2_OVER_PI = 0.79788456080286535587989211986876f;
+    const float val = SQRT_2_OVER_PI*x*(1.0f + GELU_COEF_A*x*x);
+    return 0.5f*x*(2.0f - 2.0f / (exp(2.0f * val) + 1.0f));
+}
 #endif
 
 layout (push_constant) uniform parameter
@@ -399,6 +407,8 @@ void main() {
     }
 #else
     const bool has_bias = (p.fusion_flags & 1) != 0;
+    const bool has_addm = (p.fusion_flags & 2) != 0;
+    const bool has_gelu = (p.fusion_flags & 4) != 0;
     const bool is_aligned = p.stride_d % 4 == 0;  // Assumption: D_TYPE == float
 
     [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
@@ -414,6 +424,16 @@ void main() {
                     coopMatLoad(cm_bias, data_bias, dr + cm_row * TM, 0, gl_CooperativeMatrixLayoutColumnMajor);
                     cm_dtype = cm_dtype + cm_bias;
                 }
+                if (has_addm) {
+                    coopmat<D_TYPE, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> cm_addm;
+                    coopMatLoad(cm_addm, data_addm, offsets + (dc + cm_col * TN) * p.stride_d + dr + cm_row * TM, p.stride_d, gl_CooperativeMatrixLayoutColumnMajor);
+                    cm_dtype = cm_dtype + cm_addm;
+                }
+                if (has_gelu) {
+                    [[unroll]] for (uint i = 0; i < cm_dtype.length(); ++i) {
+                        cm_dtype[i] = D_TYPE(mm_op_gelu(float(cm_dtype[i])));
+                    }
+                }
                 coopMatStore(cm_dtype, data_d, offsets + (dc + cm_col * TN) * p.stride_d + dr + cm_row * TM, p.stride_d, gl_CooperativeMatrixLayoutColumnMajor);
             } else if (is_in_bounds) {
                 // Full coopMat is within bounds, but stride_d is not aligned (or a fused bias must be applied)
@@ -422,11 +442,18 @@ void main() {
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
                 [[unroll]] for (uint col = 0; col < TN; col += storestride) {
                     const uint out_row = dr + cm_row * TM + store_r;
+                    const uint out_idx = offsets + (dc + cm_col * TN + col + store_c) * p.stride_d + out_row;
                     D_TYPE v = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
                     if (has_bias) {
                         v += data_bias[out_row];
                     }
-                    data_d[offsets + (dc + cm_col * TN + col + store_c) * p.stride_d + out_row] = v;
+                    if (has_addm) {
+                        v += data_addm[out_idx];
+                    }
+                    if (has_gelu) {
+                        v = D_TYPE(mm_op_gelu(float(v)));
+                    }
+                    data_d[out_idx] = v;
                 }
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
             } else if (dr + cm_row * TM < p.M && dc + cm_col * TN < p.N) {
@@ -437,11 +464,18 @@ void main() {
                 [[unroll]] for (uint col = 0; col < TN; col += storestride) {
                     if (dr + cm_row * TM + store_r < p.M && dc + cm_col * TN + col + store_c < p.N) {
                         const uint out_row = dr + cm_row * TM + store_r;
+                        const uint out_idx = offsets + (dc + cm_col * TN + col + store_c) * p.stride_d + out_row;
                         D_TYPE v = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
                         if (has_bias) {
                             v += data_bias[out_row];
                         }
-                        data_d[offsets + (dc + cm_col * TN + col + store_c) * p.stride_d + out_row] = v;
+                        if (has_addm) {
+                            v += data_addm[out_idx];
+                        }
+                        if (has_gelu) {
+                            v = D_TYPE(mm_op_gelu(float(v)));
+                        }
+                        data_d[out_idx] = v;
                     }
                 }
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
@@ -473,19 +507,35 @@ void main() {
                     }
 #else
                     const bool has_bias = (p.fusion_flags & 1) != 0;
+                    const bool has_addm = (p.fusion_flags & 2) != 0;
+                    const bool has_gelu = (p.fusion_flags & 4) != 0;
                     if (dr_warp + 2 * cr < p.M && dc_warp + cc < p.N) {
+                        const uint out_idx = offsets + (dc_warp + cc) * p.stride_d + dr_warp + 2 * cr;
                         D_TYPE vx = D_TYPE(sums[sums_idx].x);
                         if (has_bias) {
                             vx += data_bias[dr_warp + 2 * cr];
                         }
-                        data_d[offsets + (dc_warp + cc) * p.stride_d + dr_warp + 2 * cr] = vx;
+                        if (has_addm) {
+                            vx += data_addm[out_idx];
+                        }
+                        if (has_gelu) {
+                            vx = D_TYPE(mm_op_gelu(float(vx)));
+                        }
+                        data_d[out_idx] = vx;
                     }
                     if (dr_warp + 2 * cr + 1 < p.M && dc_warp + cc < p.N) {
+                        const uint out_idx = offsets + (dc_warp + cc) * p.stride_d + dr_warp + 2 * cr + 1;
                         D_TYPE vy = D_TYPE(sums[sums_idx].y);
                         if (has_bias) {
                             vy += data_bias[dr_warp + 2 * cr + 1];
                         }
-                        data_d[offsets + (dc_warp + cc) * p.stride_d + dr_warp + 2 * cr + 1] = vy;
+                        if (has_addm) {
+                            vy += data_addm[out_idx];
+                        }
+                        if (has_gelu) {
+                            vy = D_TYPE(mm_op_gelu(float(vy)));
+                        }
+                        data_d[out_idx] = vy;
                     }
 #endif // MUL_MAT_ID
                 }
